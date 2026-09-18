@@ -1,7 +1,7 @@
 # Project FRIDAY
 
 > **An Autonomous, Multimodal AI Desktop Assistant & Spatial Operating System for macOS**
-> Voice-first, Gemini-only. A holographic orb you talk to, a deck of live data widgets it composes for you, an interactive 3D spatial engine, and deep native OS control — with background agents doing the heavy lifting off the audio path.
+> Voice-first, Gemini-only. A neural brain you talk to, a deck of live data widgets it composes for you, an interactive 3D spatial engine, and deep native OS control — with background agents doing the heavy lifting off the audio path.
 
 ---
 
@@ -73,21 +73,25 @@ Driven purely by how many widgets are mounted:
 
 Transitions interpolate over `0.6s cubic-bezier(0.16, 1, 0.3, 1)`, and both WebGL renderers are re-fitted during the animation so nothing stretches.
 
-### The orb as status
+### The brain as status
 
-State drives colour; colour holds until the state changes. Nothing else can shift the hue — audio drives motion and brightness only.
+FRIDAY's presence is a neural brain — `web_gui/components/brain_orb.js`, ported from [threejs-brain-animation](https://github.com/bytezpro/threejs-brain-animation). It loads `brain.glb` (2,879 vertices) and lays two layers over the same points: a soft particle at every vertex, and a tiny wireframe node at every third one. The reference swells nodes near the cursor; here the same effect is driven by session state, with no pointer.
 
-| State | Colour | Meaning |
+Hue is a function of state; audio drives **motion** only and never tints it.
+
+| State | Look | Meaning |
 |---|---|---|
-| Idle | `#00F2FE` calm cyan | Connected, waiting |
-| Listening | `#0077FF` deep blue | Your voice is coming in |
-| Thinking | `#FFB800` amber | Tool running or agent working |
-| Speaking | `#00FF88` emerald | FRIDAY is talking |
-| Offline | `#E5726F` ember | Hub unreachable |
+| Idle | cyan crown into indigo matter, slow y-rotation, gentle breathing | Connected, waiting |
+| Listening | same palette; synaptic wave fronts travel through the mesh, height from the mic | Your voice is coming in |
+| Thinking | **magenta** — every node swells and spins, particles disperse outward along their normals, rotation quickens | Tool running or agent working |
+| Speaking | cyan/indigo; harmonic contraction pulsing with playback volume | FRIDAY is talking |
+| Offline | dim, still, ember-tinted | Hub unreachable |
 
-Over all five, a fixed violet-to-blush accent (`#A18CD1` → `#FBC2EB`) tints the rim highlight and the outer bloom. It carries no state — it is purely FRIDAY's finish, and the state hue stays exactly as readable as before.
+Palette: cyan `#00F2FE`, indigo `#4A00E0`, violet `#A18CD1`, magenta `#F472B6`. The canvas is fully transparent, so the HUD ground shows through. If `brain.glb` fails to load a procedural dual-hemisphere brain is used instead — the presence must never go blank.
 
-The "speaking" state follows the hub's authoritative turn status and the **playback timeline** — audio arrives roughly 3× faster than it plays, so the orb animates in step with what you *hear*, not with what has downloaded. Tap the orb to interrupt.
+The module exposes the same `window.FridayOrb` surface as the orb it replaced (`setState`, `setLevel`, `resize`, `state`), so `app.js` drives it unchanged. Its dependencies were not carried over: per-instance uniforms are plain `InstancedBufferAttribute`s, and the reference's gsap tweens are the same lerp the old orb used.
+
+The "speaking" state follows the hub's authoritative turn status and the **playback timeline** — audio arrives roughly 3× faster than it plays, so the brain animates in step with what you *hear*, not with what has downloaded. Tap it to interrupt.
 
 ### Ambient furniture
 
@@ -384,7 +388,7 @@ project_friday/
 │   ├── index.html             # Orb stage, widget deck, telemetry HUD, sensor dock
 │   ├── style.css              # Glassmorphic spatial layout, widget renderers
 │   ├── app.js                 # WS client, audio pipeline, widget engine, orb state
-│   ├── orb.js                 # Three.js holographic orb (GLSL plasma core + glow)
+│   ├── components/brain_orb.js  # Neural brain presence (instanced nodes + particles, state-driven)
 │   ├── sve.js                 # Three.js 3D scene graph renderer
 │   ├── gestures.js            # MediaPipe HandLandmarker gesture input
 │   └── vendor/                # Vendored Three.js & MediaPipe WASM models

@@ -6,7 +6,7 @@
  * holographic orb's state/energy feed.
  *
  * The UI has no chrome: system state is expressed entirely through the orb's
- * colour and energy (see orb.js), and the SVE 3D workspace slides in beside a
+ * colour and energy (see components/brain_orb.js), and the SVE 3D workspace slides in beside a
  * docked orb whenever a spatial scene goes live.
  */
 

@@ -2,7 +2,7 @@
  * asset_viewer.js — renders a generated .glb inside a HUD card.
  *
  * app.js is a classic script and cannot import ES modules, so this follows the
- * same shape as orb.js and gestures.js: a module that hangs its API off window.
+ * same shape as components/brain_orb.js and gestures.js: a module that hangs its API off window.
  *
  * Every mounted card owns a WebGL context and browsers cap those (~16), so a
  * dismissed card MUST be disposed — mount() and the deck's dismiss path both
