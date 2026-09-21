@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "friday"
+dynamic = ["version"]
+description = "FRIDAY - a multi-node personal assistant: macOS desktop node + headless sentinel daemon"
+requires-python = ">=3.11"
+dependencies = [
+  "python-dotenv",
+  "psutil",
+  "aiohttp",
+  "google-genai",
+]
+
+[project.optional-dependencies]
+# The macOS voice/HUD node. Everything here is platform- or hardware-bound.
+desktop = [
+  "pyaudio",
+  "opencv-python",
+  "pyautogui",
+  "pillow",
+  "numpy",
+  "pyobjc-core",
+  "pyobjc-framework-Quartz",
+  "pyobjc-framework-EventKit",
+  "pywebview",
+  "websockets",
+  "httpx",
+]
+# The headless daemon needs nothing beyond the base dependencies. The extra
+# exists so `pip install -e ".[sentinel]"` reads clearly and has room to grow.
+sentinel = []
+dev = [
+  "pytest",
+  "pytest-asyncio",
+  "pytest-aiohttp",
+]
+
+[project.scripts]
+friday-sentinel = "friday.sentinel.__main__:main"
+friday-desktop = "friday.desktop.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["friday*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "friday.__version__"}
+
+[tool.setuptools.package-data]
+"friday.desktop" = ["web_gui/**/*", "models/*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

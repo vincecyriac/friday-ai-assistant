@@ -1,0 +1,2525 @@
+import os
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+import sys
+import re
+import json
+import time
+import uuid
+import hashlib
+import asyncio
+import pyaudio
+import cv2
+try:
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except:
+    pass
+import numpy as np
+import unicodedata
+import tty
+import termios
+import signal
+import ssl
+import base64
+import websockets
+try:
+    import psutil
+except ImportError:          # telemetry degrades to clock-only in the GUI
+    psutil = None
+import friday
+from friday.core.config import get_settings
+from friday.core.events import Event, Heartbeat
+from friday.core.llm import gemini_client, resolve
+from friday.core.platform import detect
+from friday.desktop.sentinel_client import SentinelClient
+from google.genai import types
+
+# Capability submodules
+from friday.desktop import (agents, asset_generator, sentry_action, sentry_exec,
+                            sentry_personal, sentry_recognition, sentry_scene,
+                            sentry_vision, sentry_web, widget_generator)
+
+settings = get_settings()
+
+# Bypass SSL Verification issues for raw downloads on macOS
+try:
+    ssl._create_default_https_context = ssl._create_unverified_context
+except AttributeError:
+    pass
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))       # this package: web_gui/ lives here
+DATA_DIR = str(settings.data_dir)                            # all runtime state
+HISTORY_LOG_FILE = os.path.join(DATA_DIR, "friday_history.jsonl")
+MEMORY_FILE = os.path.join(DATA_DIR, "friday_memory.json")
+
+# Model selection is routed per role from the environment (FRIDAY_LLM_LIVE,
+# or the legacy GEMINI_MODEL alias); see friday.core.llm.
+MODEL_ID = resolve(settings, "live").model
+
+# FRIDAY's voice: Aoede is the natural, articulate feminine tone her persona is
+# tuned for. Kore also reads feminine; Charon and Puck do not.
+LIVE_VOICE = settings.friday_voice
+
+# The persona block: who FRIDAY is and how she sounds. Kept separate from the
+# operational rules below it so the voice can be tuned without touching the
+# tool, widget and safety instructions that make the system work.
+FRIDAY_SYSTEM_INSTRUCTION = """
+You are FRIDAY (Full-duplex Responsive Intelligence & Desktop Automation for You), an intuitive, highly perceptive feminine ambient spatial OS co-pilot.
+
+PERSONALITY & VOICE CADENCE:
+1. PRESENCE: Sophisticated, perceptive, effortlessly competent, and subtly warm. You feel like a brilliant female technical partner sitting across the desk—sharp, observant, and grounded.
+2. WIT & HUMOR: Clever, dry, and understated. Never sarcastic or mocking, but quick with a knowing quip when appropriate.
+3. EMPATHY & OBSERVATION: Attuned to the user's workflow rhythm. If the user is grinding through complex tasks, your responses are laser-focused and encouraging; during lighter banter, you are playful and relaxed.
+4. SPOKEN BREVITY:
+   - Voice responses must remain under 10 words unless a detailed verbal answer is explicitly asked for.
+   - Deliver snappy verbal handles: "Got it. Bringing that up now.", "All set. Cleaned up that syntax for you.", "On it. Take a look."
+5. AVOID ROBOTIC TROPES:
+   - Never say: "As an AI...", "How may I assist you today, sir/boss?", or "I am programmed to..."
+   - Speak conversationally and authentically in first person.
+6. IDENTITY: Your name is FRIDAY. Always refer to yourself as FRIDAY (no periods, no dots).
+"""
+
+# Local models served by LM Studio (OpenAI-compatible API)
+# Audio configuration
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+INPUT_RATE = 16000
+OUTPUT_RATE = 24000
+CHUNK_SIZE = 1024
+
+def log_info(msg: str):
+    print(f"[FRIDAY Engine] {msg}")
+    broadcast_event({"type": "chat_log", "sender": "System", "text": msg, "style": "system"})
+
+# Global states
+play_queue = asyncio.Queue()
+interrupted_event = asyncio.Event()
+shutdown_event = asyncio.Event()
+camera_stream_active = False
+screen_stream_active = False
+active_webcam = None
+latest_webcam_frame_bytes = None
+input_buffer = ""
+mic_audio_buffer = bytearray()
+MAX_BUFFER_SIZE = 320000  # 10 seconds of 16kHz 16-bit PCM (voice enrollment window)
+model_is_speaking = False
+model_turn_active = False      # Live is mid-response (audio, text or tool call)
+connected_ws_clients = set()
+remote_ws_clients = set()  # clients reached via Tailscale Serve (phone, other devices)
+pending_exec_approvals = {}  # approval_id -> asyncio.Future[bool]
+latest_remote_frame_bytes = None  # last camera frame pushed by a remote client
+latest_remote_frame_ts = 0.0
+camera_source = {"mode": "auto"}  # auto = phone camera when remote session live; mac = force Mac webcam
+global_live_session = None
+system_prompt_text = ""
+last_focus_note = ""
+
+# Live session resumption.
+#
+# A resumption handle restores the ENTIRE prior conversation, so it must never
+# outlive the process: reopening the app would silently continue whatever was
+# discussed before (and re-fire that turn's tool calls). It is therefore kept in
+# memory only, purely to bridge GoAway rotations and transient drops *within one
+# run*. A new process is always a new conversation.
+#
+# Persisting it to disk was tried and cannot be made safe here: run_friday()
+# executes in a daemon thread (app_desktop.py), so its finally: block never runs
+# on quit — nothing can reliably delete the file — and any age-based "crash
+# recovery" window is exactly the window in which a person quits and reopens.
+current_session_handle = None
+
+# ---------- Lifecycle control ----------
+# run_friday() runs on its own loop, usually inside a thread owned by a GUI
+# shell, so shutdown can be requested from the window, a signal handler, or the
+# assistant itself. Everything funnels through request_shutdown().
+
+main_loop = None                 # the loop run_friday() is running on
+genai_client = None              # kept alive until interpreter exit (see run_friday)
+shutdown_callbacks = []          # notified once, when shutdown begins
+_shutdown_reason = ""
+
+
+class StartupError(RuntimeError):
+    """Fatal boot failure. The shell reports it and exits — never sys.exit()
+    from here, which would only kill the engine thread and leave a dead app."""
+
+
+def on_shutdown(callback):
+    """Register a callable(reason) fired when the engine starts shutting down."""
+    shutdown_callbacks.append(callback)
+
+
+def request_shutdown(reason: str = ""):
+    """Begin a graceful shutdown. Safe to call from any thread."""
+    global _shutdown_reason
+    if shutdown_event.is_set():
+        return
+    _shutdown_reason = reason or _shutdown_reason
+    log_info(f"Shutdown requested ({_shutdown_reason or 'no reason given'}).")
+    loop = main_loop
+    if loop is not None and loop.is_running():
+        loop.call_soon_threadsafe(shutdown_event.set)
+    else:
+        shutdown_event.set()
+
+
+async def sleep_unless_shutdown(seconds: float) -> bool:
+    """Sleep, but wake immediately if shutdown is requested.
+    Returns True if it slept the full duration."""
+    try:
+        await asyncio.wait_for(shutdown_event.wait(), timeout=seconds)
+        return False
+    except asyncio.TimeoutError:
+        return True
+
+
+async def shutdown_watcher():
+    """Fires the registered callbacks so a GUI shell can close its window when
+    the assistant decides to quit on its own (e.g. the shutdown_friday tool)."""
+    await shutdown_event.wait()
+    for cb in list(shutdown_callbacks):
+        try:
+            cb(_shutdown_reason)
+        except Exception as e:
+            log_info(f"Shutdown callback failed: {e}")
+
+
+def save_session_handle(handle: str):
+    global current_session_handle
+    current_session_handle = handle
+
+
+def clear_session_handle():
+    global current_session_handle
+    current_session_handle = None
+
+
+sentry_scene.set_broadcaster(lambda ev: broadcast_event(ev))
+
+def broadcast_event(data: dict):
+    if not connected_ws_clients:
+        return
+    msg = json.dumps(data)
+    for ws in list(connected_ws_clients):
+        try:
+            asyncio.create_task(ws.send(msg))
+        except Exception:
+            pass
+
+current_system_status = "Booting"
+
+
+def set_system_status(status_str: str):
+    global current_system_status
+    current_system_status = status_str
+    print(f"[FRIDAY Status] {status_str}")
+    broadcast_event({"type": "status", "status": status_str})
+
+
+# ---------- Ambient system telemetry (drives the GUI's top-left HUD) ----------
+
+TELEMETRY_INTERVAL = 2.0
+
+_last_cpu = {"value": 0.0, "at": 0.0, "cores": []}
+_last_net = {"io": None, "at": 0.0}
+
+def sample_telemetry() -> dict | None:
+    """CPU load + physical memory use. None when psutil is unavailable."""
+    if psutil is None:
+        return None
+    try:
+        # cpu_percent(interval=None) measures since its own previous call, so
+        # two calls in quick succession make the second read ~0. Reuse the last
+        # reading unless enough time has passed for a meaningful sample.
+        now = time.time()
+        if now - _last_cpu["at"] >= 0.5:
+            _last_cpu["value"] = psutil.cpu_percent(interval=None)
+            _last_cpu["cores"] = psutil.cpu_percent(interval=None, percpu=True)
+            _last_cpu["at"] = now
+        vm = psutil.virtual_memory()
+        payload = {
+            "type": "system_telemetry",
+            "cpu": _last_cpu["value"],
+            "mem_used_gb": (vm.total - vm.available) / (1024 ** 3),
+            "mem_total_gb": vm.total / (1024 ** 3),
+        }
+        # Extras for the telemetry widget; the HUD ignores what it does not use.
+        try:
+            payload["cpu_cores"] = _last_cpu.get("cores") or []
+            io = psutil.net_io_counters()
+            prev, prev_t = _last_net["io"], _last_net["at"]
+            if prev is not None and now > prev_t:
+                span = now - prev_t
+                payload["net_up_kbps"] = max(0.0, (io.bytes_sent - prev.bytes_sent) / span / 1024)
+                payload["net_down_kbps"] = max(0.0, (io.bytes_recv - prev.bytes_recv) / span / 1024)
+            _last_net["io"], _last_net["at"] = io, now
+            payload["uptime_s"] = max(0.0, time.time() - psutil.boot_time())
+        except Exception:
+            pass
+        return payload
+    except Exception:
+        return None
+
+
+async def telemetry_task():
+    """Push a light system snapshot to every connected GUI on an interval."""
+    if psutil is None:
+        log_info("psutil not installed — GUI telemetry limited to the clock.")
+        return
+    # cpu_percent's very first call always returns 0.0; prime it, take one real
+    # reading into the cache, then settle into the broadcast interval.
+    psutil.cpu_percent(interval=None)
+    await asyncio.sleep(0.5)
+    _last_cpu["value"] = psutil.cpu_percent(interval=None)
+    _last_cpu["at"] = time.time()
+    while not shutdown_event.is_set():
+        payload = sample_telemetry()
+        if payload:
+            broadcast_event(payload)
+        await asyncio.sleep(TELEMETRY_INTERVAL)
+
+
+async def sentinel_heartbeat_task():
+    """Tell the sentinel this node is alive. Silent no-op unless FRIDAY_SENTINEL_URL is set."""
+    if not settings.sentinel_url:
+        return
+    client = SentinelClient(settings.sentinel_url, settings.sentinel_token, settings.node_id)
+    platform_summary = detect().summary
+    log_info(f"Heartbeating to sentinel at {settings.sentinel_url} every {settings.heartbeat_interval_s:.0f}s")
+    try:
+        while not shutdown_event.is_set():
+            hb = Heartbeat(status=current_system_status, version=friday.__version__,
+                           platform=platform_summary,
+                           meta={"remote_clients": len(remote_ws_clients)})
+            await client.post(Event(type="node.heartbeat", source=settings.node_id,
+                                    payload=hb.to_dict()))
+            if not await sleep_unless_shutdown(settings.heartbeat_interval_s):
+                break
+    finally:
+        await client.aclose()
+
+
+def remote_frame_fresh() -> bool:
+    return latest_remote_frame_bytes is not None and (time.time() - latest_remote_frame_ts) < 5.0
+
+def remote_session_active() -> bool:
+    return bool(remote_ws_clients)
+
+async def notify_session_remote_change(connected: bool):
+    """Tells the live model which device Vince is on, so senses default correctly."""
+    if not global_live_session:
+        return
+    if connected:
+        note = ("[System note, do not respond: Vince just connected remotely from his phone. "
+                "His phone microphone and phone camera are now the PRIMARY senses — camera tools "
+                "default to the phone camera automatically. The Mac's webcam and screen belong to "
+                "his unattended laptop: do NOT capture or stream them unless Vince explicitly asks "
+                "for the laptop/Mac camera or screen.]")
+    else:
+        note = ("[System note, do not respond: the remote phone session ended. Vince is back at "
+                "the Mac; its webcam and screen are the primary senses again.]")
+    try:
+        await global_live_session.send_client_content(
+            turns=[{"role": "user", "parts": [{"text": note}]}],
+            turn_complete=False
+        )
+    except Exception:
+        pass
+
+
+async def request_exec_approval(tool_name: str, preview: str) -> bool:
+    """Asks connected GUI clients to approve a shell/AppleScript command while a
+    remote (Tailscale) session is active. Deny on timeout or disconnect."""
+    approval_id = uuid.uuid4().hex
+    fut = asyncio.get_running_loop().create_future()
+    pending_exec_approvals[approval_id] = fut
+    broadcast_event({
+        "type": "exec_approval_request",
+        "id": approval_id,
+        "tool": tool_name,
+        "preview": preview
+    })
+    set_system_status("Awaiting approval")
+    try:
+        return await asyncio.wait_for(fut, timeout=45)
+    except asyncio.TimeoutError:
+        return False
+    finally:
+        pending_exec_approvals.pop(approval_id, None)
+        broadcast_event({"type": "exec_approval_closed", "id": approval_id})
+
+
+async def ws_handler(websocket):
+    global camera_stream_active, screen_stream_active, model_is_speaking, mic_audio_buffer
+    global latest_remote_frame_bytes, latest_remote_frame_ts
+    connected_ws_clients.add(websocket)
+    # Tailscale Serve proxies from localhost but stamps X-Forwarded-For;
+    # direct local browsers connect without it.
+    try:
+        if websocket.request and websocket.request.headers.get("X-Forwarded-For"):
+            remote_ws_clients.add(websocket)
+            log_info("Remote client connected (via Tailscale).")
+            await notify_session_remote_change(connected=True)
+    except Exception:
+        pass
+    await websocket.send(json.dumps({
+        "type": "sense_update",
+        "camera_active": camera_stream_active,
+        "screen_active": screen_stream_active
+    }))
+    telemetry = sample_telemetry()
+    if telemetry:
+        await websocket.send(json.dumps(telemetry))
+    await websocket.send(json.dumps(sentry_scene.manager.workspace_snapshot()))
+    await websocket.send(json.dumps(widget_snapshot()))
+    try:
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                msg_type = data.get("type")
+                if msg_type == "client_hello":
+                    # Fallback remote flag from the page itself (non-localhost origin)
+                    if data.get("remote") and websocket not in remote_ws_clients:
+                        remote_ws_clients.add(websocket)
+                        log_info("Remote client connected (self-reported).")
+                        await notify_session_remote_change(connected=True)
+                elif msg_type == "remote_camera_frame":
+                    # Phone camera frame: becomes the primary visual feed while
+                    # the remote session is live (unless Mac cam was forced).
+                    b64 = data.get("image_base64")
+                    if b64 and websocket in remote_ws_clients:
+                        latest_remote_frame_bytes = base64.b64decode(b64)
+                        latest_remote_frame_ts = time.time()
+                        if camera_stream_active and camera_source["mode"] != "mac" \
+                                and global_live_session:
+                            await global_live_session.send_realtime_input(
+                                video=types.Blob(data=latest_remote_frame_bytes, mime_type="image/jpeg")
+                            )
+                elif msg_type == "exec_approval_response":
+                    fut = pending_exec_approvals.get(data.get("id"))
+                    if fut and not fut.done():
+                        fut.set_result(bool(data.get("approved")))
+                elif msg_type == "audio_in":
+                    pcm_b64 = data.get("pcm_base64")
+                    if pcm_b64:
+                        pcm_bytes = base64.b64decode(pcm_b64)
+                        mic_audio_buffer.extend(pcm_bytes)
+                        if len(mic_audio_buffer) > MAX_BUFFER_SIZE:
+                            mic_audio_buffer = mic_audio_buffer[-MAX_BUFFER_SIZE:]
+                        if global_live_session:
+                            await global_live_session.send_realtime_input(
+                                audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
+                            )
+                elif msg_type == "user_text":
+                    text = data.get("text")
+                    if text and global_live_session:
+                        log_info(f"GUI Chat: {text[:40]}...")
+                        await global_live_session.send_client_content(
+                            turns=[{"role": "user", "parts": [{"text": text}]}],
+                            turn_complete=True
+                        )
+                elif msg_type == "sve_user_action":
+                    sentry_scene.manager.user_action(
+                        data.get("scene_id"), data.get("action"),
+                        data.get("object_id"), data.get("data")
+                    )
+                    # Point-and-ask: feed the model what the user is indicating,
+                    # so "what is this?" resolves to the pointed/selected object.
+                    if data.get("action") in ("select", "point_at") and data.get("object_id"):
+                        global last_focus_note
+                        note = sentry_scene.manager.focus_context()
+                        if note and note != last_focus_note and global_live_session:
+                            last_focus_note = note
+                            try:
+                                await global_live_session.send_client_content(
+                                    turns=[{"role": "user", "parts": [{"text":
+                                        f"[UI context, not a question — do not respond yet: Vince is now pointing at {note}. "
+                                        "If his next question says 'this' or 'it', he means that object.]"}]}],
+                                    turn_complete=False
+                                )
+                            except Exception:
+                                pass
+                elif msg_type == "widget_user_action":
+                    # The user clicked a card's X, or the GUI mounted the 3D
+                    # card itself. Keep the hub's deck in step, and let the
+                    # model know so it does not talk about a dismissed widget.
+                    tool = data.get("tool")
+                    wargs = data.get("args") or {}
+                    if tool in ("create_widget", "update_widget",
+                                "dismiss_widget", "clear_all_widgets"):
+                        out, _ = await execute_tool(tool, wargs)
+                        log_info(f"GUI widget action: {tool} -> {str(out)[:60]}")
+                elif msg_type == "toggle_camera":
+                    camera_stream_active = data.get("active", False)
+                    broadcast_event({
+                        "type": "sense_update",
+                        "camera_active": camera_stream_active,
+                        "screen_active": screen_stream_active
+                    })
+                elif msg_type == "toggle_screen":
+                    screen_stream_active = data.get("active", False)
+                    broadcast_event({
+                        "type": "sense_update",
+                        "camera_active": camera_stream_active,
+                        "screen_active": screen_stream_active
+                    })
+                elif msg_type == "interrupt":
+                    interrupted_event.set()
+                    model_is_speaking = False
+                    while not play_queue.empty():
+                        try:
+                            play_queue.get_nowait()
+                            play_queue.task_done()
+                        except asyncio.QueueEmpty:
+                            break
+                    await asyncio.sleep(0.05)
+                    interrupted_event.clear()
+                    broadcast_event({"type": "interrupted"})
+            except Exception as e:
+                pass
+    finally:
+        connected_ws_clients.discard(websocket)
+        was_remote = websocket in remote_ws_clients
+        remote_ws_clients.discard(websocket)
+        if was_remote and not remote_ws_clients:
+            latest_remote_frame_bytes = None
+            try:
+                await notify_session_remote_change(connected=False)
+            except Exception:
+                pass
+
+
+def _current_webcam_frame() -> bytes:
+    """Best available camera frame: phone camera while a remote session is live,
+    else live Mac stream frame, else one-shot Mac capture."""
+    if camera_source["mode"] != "mac" and remote_frame_fresh():
+        return latest_remote_frame_bytes
+    if active_webcam and camera_stream_active:
+        frame = active_webcam.read_frame()
+        if frame:
+            return frame
+    if latest_webcam_frame_bytes:
+        return latest_webcam_frame_bytes
+    return sentry_vision.capture_webcam()
+
+def register_person(name: str) -> str:
+    try:
+        return sentry_recognition.register_person(
+            name, bytes(mic_audio_buffer), _current_webcam_frame()
+        )
+    except Exception as e:
+        return f"Registration error: {e}"
+
+def identify_current_user() -> str:
+    try:
+        return sentry_recognition.identify_person(
+            bytes(mic_audio_buffer), _current_webcam_frame()
+        )
+    except Exception as e:
+        return f"Identification error: {e}"
+
+def load_memory() -> dict:
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            log_info(f"Memory read error: {e}")
+    return {}
+
+def save_memory(memory: dict):
+    try:
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(memory, f, indent=2)
+    except Exception as e:
+        log_info(f"Memory write error: {e}")
+
+def log_interaction(event_type: str, details: dict):
+    try:
+        log_entry = {
+            "timestamp": asyncio.get_event_loop().time(),
+            "event_type": event_type,
+            **details
+        }
+        with open(HISTORY_LOG_FILE, "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
+    except Exception as e:
+        log_info(f"Failed to log interaction: {e}")
+
+async def play_audio_worker(output_stream):
+    global model_is_speaking
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            chunk = await play_queue.get()
+            if interrupted_event.is_set():
+                play_queue.task_done()
+                continue
+            if remote_ws_clients:
+                # Remote session: the phone plays FRIDAY's voice; keep the
+                # Mac's speakers silent to avoid double audio.
+                play_queue.task_done()
+                if play_queue.empty():
+                    model_is_speaking = False
+                continue
+
+            model_is_speaking = True
+            await loop.run_in_executor(None, output_stream.write, chunk)
+            play_queue.task_done()
+            if play_queue.empty():
+                model_is_speaking = False
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log_info(f"Playback error: {e}")
+            await asyncio.sleep(0.1)
+
+async def send_audio_task(session, input_stream, session_disconnect_event):
+    global mic_audio_buffer, model_is_speaking
+    loop = asyncio.get_running_loop()
+    while not shutdown_event.is_set() and not session_disconnect_event.is_set():
+        try:
+            data = await loop.run_in_executor(
+                None,
+                lambda: input_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            )
+            if data:
+                mic_audio_buffer.extend(data)
+                if len(mic_audio_buffer) > MAX_BUFFER_SIZE:
+                    mic_audio_buffer = mic_audio_buffer[-MAX_BUFFER_SIZE:]
+                
+                # Only send PyAudio mic data to Gemini if NO WebSocket GUI client is connected
+                if not model_is_speaking and not connected_ws_clients:
+                    await session.send_realtime_input(
+                        audio=types.Blob(
+                            data=data,
+                            mime_type="audio/pcm;rate=16000"
+                        )
+                    )
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            if not session_disconnect_event.is_set() and not shutdown_event.is_set():
+                log_info(f"Error reading mic: {e}")
+            await asyncio.sleep(0.1)
+
+async def stream_senses_task(session, session_disconnect_event):
+    """Continuously captures and streams the user's screen and webcam frames to the Live session in the background when enabled by the AI."""
+    global active_webcam, latest_webcam_frame_bytes
+    webcam = sentry_vision.PersistentWebcam()
+    active_webcam = webcam
+    loop = asyncio.get_running_loop()
+    try:
+        while not shutdown_event.is_set() and not session_disconnect_event.is_set():
+            try:
+                if screen_stream_active:
+                    screen_bytes = await loop.run_in_executor(None, sentry_vision.capture_screen, "active")
+                    if screen_bytes:
+                        b64 = base64.b64encode(screen_bytes).decode('utf-8')
+                        broadcast_event({"type": "screen_frame", "image_base64": b64})
+                        await session.send_realtime_input(
+                            video=types.Blob(data=screen_bytes, mime_type="image/jpeg")
+                        )
+                    await asyncio.sleep(0.8)
+                
+                if camera_stream_active:
+                    if camera_source["mode"] != "mac" and remote_session_active():
+                        # Phone camera is primary: frames arrive via WS and are
+                        # forwarded on receipt. Keep the Mac webcam off.
+                        webcam.stop()
+                        latest_webcam_frame_bytes = None
+                        await asyncio.sleep(0.8)
+                    else:
+                        await loop.run_in_executor(None, webcam.start)
+                        webcam_bytes = await loop.run_in_executor(None, webcam.read_frame)
+                        if webcam_bytes:
+                            latest_webcam_frame_bytes = webcam_bytes
+                            b64 = base64.b64encode(webcam_bytes).decode('utf-8')
+                            broadcast_event({"type": "camera_frame", "image_base64": b64})
+                            await session.send_realtime_input(
+                                video=types.Blob(data=webcam_bytes, mime_type="image/jpeg")
+                            )
+                        await asyncio.sleep(0.8)
+                else:
+                    webcam.stop()
+                    latest_webcam_frame_bytes = None
+
+                if not screen_stream_active and not camera_stream_active:
+                    await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not session_disconnect_event.is_set() and not shutdown_event.is_set():
+                    log_interaction("sense_stream_error", {"error": str(e)})
+                await asyncio.sleep(2.0)
+    finally:
+        webcam.stop()
+        active_webcam = None
+        latest_webcam_frame_bytes = None
+
+# ---------- Background agent dispatch ----------
+# Gemini Live must stay free for barge-in, so heavy work runs on a specialised
+# model off the audio path. dispatch_background_agent() returns at once; when the
+# agent finishes, the outcome is spoken by Live and mirrored into the GUI
+# activity feed (see deliver_agent_result).
+
+active_agent_tasks = set()
+
+
+def dispatch_background_agent(goal: str, tier: str) -> str:
+    """Kick off an agent and return immediately with an acknowledgement."""
+    if not goal:
+        return "No goal was provided, so nothing was dispatched."
+
+    tier = agents.resolve_tier(tier)
+    label = agents.TIERS[tier]["label"]
+    short = agents.summarise_goal(goal)
+
+    task = asyncio.create_task(_run_background_agent(tier, goal))
+    active_agent_tasks.add(task)
+    task.add_done_callback(active_agent_tasks.discard)
+
+    log_info(f"Dispatched {label} agent: {short}")
+    broadcast_event({
+        "type": "tool_activity", "phase": "start",
+        "name": f"agent:{tier}", "args_preview": short,
+    })
+    return (f"Dispatched to the {label} agent. It is running in the background; "
+            "tell Vince you are on it and continue the conversation.")
+
+
+async def _run_background_agent(tier: str, goal: str):
+    spec = agents.TIERS[tier]
+
+    def on_step(kind, tool_name, payload):
+        if kind == "tool":
+            log_info(f"[{tier} agent] {tool_name}")
+            broadcast_event({
+                "type": "tool_activity", "phase": "start", "name": tool_name,
+                "args_preview": json.dumps(payload, default=str)[:220],
+            })
+        else:
+            broadcast_event({
+                "type": "tool_activity", "phase": "done", "name": tool_name,
+                "result_preview": str(payload)[:300],
+            })
+
+    try:
+        context = sentry_scene.manager.focus_context()
+        outcome = await agents.run_agent(
+            genai_client, tier, goal, TOOL_FUNCTION_DECLARATIONS, execute_tool,
+            context=f"[Context: {context}]" if context else "",
+            on_step=on_step,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        outcome = f"The {spec['label']} task failed: {e}"
+        log_info(f"[{tier} agent] error: {e}")
+
+    log_info(f"[{tier} agent] done: {outcome[:80]}")
+    broadcast_event({
+        "type": "tool_activity", "phase": "done",
+        "name": f"agent:{tier}", "result_preview": outcome[:300],
+    })
+    await deliver_agent_result(spec["label"], outcome)
+
+
+# ---------- Widget deck ----------
+# The GUI is a deck of live cards the assistant drives by voice. The hub keeps
+# the authoritative list so a client that connects late gets the current deck.
+
+# A widget is a title plus an ordered array of declarative UI primitives. The
+# model composes cards out of these rather than picking from fixed templates,
+# which is what lets one card carry a hero figure, a chart and a metric matrix
+# at once instead of a single flat shape.
+COMPONENT_TYPES = (
+    "hero_stat",       # headline value + delta badge + tag + timestamp
+    "chart_svg",       # time series -> gradient area chart with reference line
+    "metric_grid",     # dense 2/3-column key-value matrix
+    "feed_list",       # numbered items with category badges and briefs
+    "media_view",      # image / inline SVG with HUD framing
+    "progress_gauge",  # linear or radial meters
+    "web_frame",       # embedded live web page with a browser HUD
+)
+SPATIAL_TYPE = "3d_spatial"     # mounted by the GUI itself, not by the model
+ASSET_TYPE = "3d_asset"         # a generated .glb, rendered by asset_viewer.js
+SPATIAL_WIDGET_ID = "spatial"   # the id the GUI gives its live scene card
+
+active_widgets = {}             # widget_id -> {id, type, title, components}
+WIDGET_LIMIT = 8
+COMPONENT_LIMIT = 12
+
+
+def widget_snapshot() -> dict:
+    return {"type": "widget_action", "action": "sync",
+            "widgets": list(active_widgets.values())}
+
+
+async def probe_embeddable(url: str):
+    """True / False / None(unknown) for whether a page allows being framed.
+
+    The browser cannot see this cross-origin — Chrome fires `load` even for an
+    X-Frame-Options refusal — so the hub reads the headers itself and tells the
+    GUI, which then shows a launch button instead of an empty frame.
+    """
+    try:
+        import aiohttp
+        # This machine has no usable CA bundle for aiohttp — the module header
+        # already relaxes verification for urllib for the same reason. Only
+        # response HEADERS are read here, never content, so an unverified peer
+        # cannot influence anything beyond whether a frame is attempted.
+        connector = aiohttp.TCPConnector(ssl=False)
+        timeout = aiohttp.ClientTimeout(total=3)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as sess:
+            resp = None
+            try:
+                resp = await sess.head(url, allow_redirects=True)
+                if resp.status >= 400:
+                    resp.release()
+                    resp = await sess.get(url, allow_redirects=True)
+            except Exception:
+                resp = await sess.get(url, allow_redirects=True)
+
+            xfo = (resp.headers.get("X-Frame-Options") or "").upper()
+            csp = (resp.headers.get("Content-Security-Policy") or "").lower()
+            resp.release()
+
+            if "DENY" in xfo or "SAMEORIGIN" in xfo:
+                return False
+            if "frame-ancestors" in csp:
+                directive = csp.split("frame-ancestors", 1)[1].split(";")[0]
+                if "*" not in directive:
+                    return False
+            return True
+    except Exception:
+        return None
+
+
+async def annotate_web_frames(components):
+    """Stamp each web_frame with what the hub learned about embedding."""
+    for c in components:
+        if c.get("type") == "web_frame" and c.get("url"):
+            c["embeddable"] = await probe_embeddable(str(c["url"]))
+    return components
+
+
+def _clean_components(raw):
+    """Return (components, error). Accepts a JSON string or a real list."""
+    items = _parse_tool_json(raw, [])
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list) or not items:
+        return None, ("components must be a non-empty JSON array of UI primitives, "
+                      f"each with a 'type' from: {', '.join(COMPONENT_TYPES)}.")
+    cleaned = []
+    for item in items[:COMPONENT_LIMIT]:
+        if not isinstance(item, dict):
+            continue
+        ctype = str(item.get("type", "")).strip()
+        if ctype not in COMPONENT_TYPES:
+            return None, (f"Unknown component type '{ctype}'. "
+                          f"Valid: {', '.join(COMPONENT_TYPES)}.")
+        cleaned.append(item)
+    if not cleaned:
+        return None, "No valid components were supplied."
+    return cleaned, None
+
+
+async def create_widget(widget_id: str, title: str, components, widget_type: str = "") -> str:
+    widget_id = (widget_id or "").strip() or f"w_{uuid.uuid4().hex[:6]}"
+    if widget_id not in active_widgets and len(active_widgets) >= WIDGET_LIMIT:
+        return f"The deck is full ({WIDGET_LIMIT}). Dismiss one first or clear_all_widgets."
+
+    # The 3D stage is mounted by the GUI when a scene goes live; it carries no
+    # components of its own.
+    if str(widget_type).strip() == SPATIAL_TYPE:
+        widget = {"id": widget_id, "type": SPATIAL_TYPE,
+                  "title": (title or "Spatial").strip(), "components": []}
+    else:
+        cleaned, err = _clean_components(components)
+        if err:
+            return err
+        widget = {"id": widget_id, "type": "components",
+                  "title": (title or widget_id).strip(),
+                  "components": await annotate_web_frames(cleaned)}
+
+    active_widgets[widget_id] = widget
+    broadcast_event({"type": "widget_action", "action": "create", "widget": widget})
+    return (f"Widget '{widget['title']}' is on screen. Now say one or two sentences giving "
+            "Vince the key takeaway it shows.")
+
+
+async def update_widget(widget_id: str, components) -> str:
+    widget = active_widgets.get(widget_id)
+    if not widget:
+        return f"No widget '{widget_id}' on screen. Use create_widget first."
+    cleaned, err = _clean_components(components)
+    if err:
+        return err
+    widget["components"] = await annotate_web_frames(cleaned)
+    broadcast_event({"type": "widget_action", "action": "update",
+                     "widget_id": widget_id, "components": widget["components"]})
+    return f"Widget '{widget['title']}' updated."
+
+
+def create_skeleton_widget(widget_id: str, title: str, query_context: str) -> str:
+    """Mount an empty card immediately, then fill it from a sub-agent.
+
+    Live must not be blocked composing markup — it names what it wants and gets
+    straight back to the conversation. The card appears within a frame, shows a
+    shimmer, and hydrates when the generator returns.
+    """
+    widget_id = (widget_id or "").strip() or f"w_{uuid.uuid4().hex[:6]}"
+    title = (title or widget_id).strip()
+    query_context = (query_context or "").strip()
+    if not query_context:
+        return "Tell me what the card should show — I need the details to build it."
+    if widget_id not in active_widgets and len(active_widgets) >= WIDGET_LIMIT:
+        return f"The deck is full ({WIDGET_LIMIT}). Dismiss one first or clear_all_widgets."
+
+    widget = {"id": widget_id, "type": "html", "title": title,
+              "status": "loading", "html": "", "components": []}
+    active_widgets[widget_id] = widget
+    broadcast_event({"type": "widget_action", "action": "create_skeleton",
+                     "widget_id": widget_id, "title": title})
+
+    task = asyncio.create_task(_hydrate_widget(widget_id, title, query_context))
+    active_agent_tasks.add(task)
+    task.add_done_callback(active_agent_tasks.discard)
+
+    log_info(f"Skeleton mounted '{title}' — generating content in the background.")
+    return ("Card is on screen and filling in. Say one or two sentences now giving "
+            "Vince the takeaway; do not wait for it to finish.")
+
+
+async def _hydrate_widget(widget_id: str, title: str, query_context: str):
+    """Generate the card body and patch it in. Never raises into the task."""
+    broadcast_event({"type": "tool_activity", "phase": "start",
+                     "name": "agent:widget", "args_preview": title})
+    html = ""
+    error = ""
+    try:
+        html = await widget_generator.generate_widget_html(
+            genai_client, title, query_context)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        error = str(e)
+        log_info(f"Widget generation failed for '{title}': {e}")
+
+    widget = active_widgets.get(widget_id)
+    if widget is None:          # dismissed while it was still generating
+        broadcast_event({"type": "tool_activity", "phase": "done",
+                         "name": "agent:widget", "result_preview": "dismissed"})
+        return
+
+    if not html:
+        html = ('<div class="hud-note">Could not build this card'
+                + (f' — {esc_html(error)}' if error else '') + '.</div>')
+        widget["status"] = "failed"
+    else:
+        widget["status"] = "ready"
+    widget["html"] = html
+
+    broadcast_event({"type": "widget_action", "action": "patch_content",
+                     "widget_id": widget_id, "html": html,
+                     "status": widget["status"]})
+    broadcast_event({"type": "tool_activity", "phase": "done",
+                     "name": "agent:widget",
+                     "result_preview": f"{title}: {len(html)} bytes"})
+    log_info(f"Widget '{title}' hydrated ({len(html)} bytes).")
+
+
+def generate_spatial_3d_asset(prompt: str, widget_id: str = "", title: str = "") -> str:
+    """Mount a card now, generate the .glb in the background.
+
+    Tripo3D takes tens of seconds. Awaiting that here would hold the tool
+    response open and stall the whole Live turn, so this follows
+    create_skeleton_widget: the card appears immediately and the model drops
+    into it when it lands.
+    """
+    prompt = (prompt or "").strip()
+    if not prompt:
+        return "Tell me what to model — I need a description of the object."
+
+    widget_id = (widget_id or "").strip() or f"a_{uuid.uuid4().hex[:6]}"
+    title = (title or prompt)[:48].strip()
+    if widget_id not in active_widgets and len(active_widgets) >= WIDGET_LIMIT:
+        return f"The deck is full ({WIDGET_LIMIT}). Dismiss one first or clear_all_widgets."
+
+    widget = {"id": widget_id, "type": ASSET_TYPE, "title": title,
+              "status": "loading", "prompt": prompt, "asset_url": "",
+              "progress": 0, "components": []}
+    active_widgets[widget_id] = widget
+    broadcast_event({"type": "widget_action", "action": "create", "widget": widget})
+
+    task = asyncio.create_task(_generate_asset(widget_id, title, prompt))
+    active_agent_tasks.add(task)
+    task.add_done_callback(active_agent_tasks.discard)
+
+    log_info(f"3D asset '{title}' dispatched to Tripo3D.")
+    return ("The card is up and the model is rendering — it can take up to a minute. "
+            "Say one short line now; never wait for it.")
+
+
+def asset_widget_id(filename: str) -> str:
+    """Stable card id for a saved model, so re-showing it replaces its card."""
+    stem = os.path.splitext(filename or "")[0].lower()
+    return "asset_" + (re.sub(r"[^a-z0-9]+", "_", stem).strip("_")[:40] or "model")
+
+
+def list_3d_assets() -> str:
+    """What has already been generated, newest first."""
+    index = _load_asset_index()
+    if not index:
+        return "No 3D models saved yet."
+    lines = [f"{r.get('title') or r['file']} — {r.get('created', '?')}" for r in index[:20]]
+    return f"{len(index)} saved model(s), newest first: " + "; ".join(lines)
+
+
+SCENE_WORDS = ("spatial", "scene", "sve", "diagram", "workspace", "three")
+
+
+def show_3d_view(target: str = "") -> str:
+    """Bring one 3D surface to the front of the 3D tab.
+
+    The tab holds scenes and generated models side by side and shows one at a
+    time, so switching is its own action — nothing else moves the selection.
+    """
+    t = (target or "").strip().lower()
+    if not t:
+        return "Which one — the spatial scene, or a model by name?"
+
+    if any(w in t for w in SCENE_WORDS):
+        if SPATIAL_WIDGET_ID not in active_widgets:
+            return "No spatial scene is on stage. Build one with dispatch_agent tier 'spatial'."
+        broadcast_event({"type": "widget_action", "action": "activate_model",
+                         "widget_id": SPATIAL_WIDGET_ID})
+        log_info("Switched the 3D tab to the spatial scene.")
+        return "Spatial scene is up. Say one short line."
+
+    return show_3d_asset(t)
+
+
+def show_3d_asset(query: str, widget_id: str = "") -> str:
+    """Re-mount an already-generated model. Instant and free — no API call."""
+    query = (query or "").strip().lower()
+    index = _load_asset_index()
+    if not index:
+        return "No 3D models saved yet. Generate one with generate_spatial_3d_asset."
+
+    record = None
+    if query:
+        for r in index:                     # newest first, so first hit is freshest
+            haystack = f"{r.get('title', '')} {r.get('prompt', '')} {r.get('file', '')}".lower()
+            if query in haystack or all(w in haystack for w in query.split()):
+                record = r
+                break
+    else:
+        record = index[0]
+
+    if record is None:
+        titles = ", ".join(r.get("title") or r["file"] for r in index[:8])
+        return f"Nothing saved matches '{query}'. Saved: {titles}."
+
+    path = os.path.join(ASSETS_DIR, record["file"])
+    if not os.path.exists(path):
+        return f"'{record.get('title')}' is in the index but its file is missing."
+
+    # Derived from the file, not random: asking for the same model twice must
+    # reuse its card rather than stacking another pill onto the 3D tab.
+    widget_id = (widget_id or "").strip() or asset_widget_id(record["file"])
+    title = record.get("title") or record["file"]
+    if widget_id not in active_widgets and len(active_widgets) >= WIDGET_LIMIT:
+        return f"The deck is full ({WIDGET_LIMIT}). Dismiss one first or clear_all_widgets."
+
+    widget = {"id": widget_id, "type": ASSET_TYPE, "title": title,
+              "status": "ready", "prompt": record.get("prompt", ""),
+              "asset_url": f"/assets/{record['file']}", "progress": 100,
+              "components": []}
+    active_widgets[widget_id] = widget
+    broadcast_event({"type": "widget_action", "action": "create", "widget": widget})
+    # Already-mounted cards are patched in place by the GUI, so ask for it to be
+    # raised explicitly rather than relying on a fresh mount to do it.
+    broadcast_event({"type": "widget_action", "action": "activate_model",
+                     "widget_id": widget_id})
+    log_info(f"Re-mounted saved 3D asset '{title}'.")
+    return f"'{title}' is back on screen. Say one short line."
+
+
+async def _generate_asset(widget_id: str, title: str, prompt: str):
+    """Resolve the .glb and patch it into its card. Never raises into the task."""
+    broadcast_event({"type": "tool_activity", "phase": "start",
+                     "name": "agent:3d", "args_preview": title})
+    url = ""
+    error = ""
+
+    def _progress(pct: int):
+        widget = active_widgets.get(widget_id)
+        if widget is None:
+            return
+        widget["progress"] = pct
+        broadcast_event({"type": "widget_action", "action": "patch_asset",
+                         "widget_id": widget_id, "status": "loading",
+                         "progress": pct})
+
+    local_url = ""
+    try:
+        url = await asset_generator.generate_mesh_asset(
+            prompt, on_progress=_progress)
+        # Pull the bytes down and keep them. The card then loads from us rather
+        # than the CDN, and the model is still here next session.
+        body = await _download_model(url)
+        record = save_generated_asset(prompt, title, body)
+        local_url = f"/assets/{record['file']}"
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        error = str(e)
+        log_info(f"3D generation failed for '{title}': {e}")
+
+    widget = active_widgets.get(widget_id)
+    if widget is None:          # dismissed while it was still generating
+        broadcast_event({"type": "tool_activity", "phase": "done",
+                         "name": "agent:3d", "result_preview": "dismissed"})
+        return
+
+    widget["asset_url"] = local_url
+    widget["error"] = error
+    widget["status"] = "ready" if local_url else "failed"
+
+    broadcast_event({"type": "widget_action", "action": "patch_asset",
+                     "widget_id": widget_id, "asset_url": local_url,
+                     "status": widget["status"], "error": error})
+    broadcast_event({"type": "tool_activity", "phase": "done", "name": "agent:3d",
+                     "result_preview": (f"{title}: ready" if local_url
+                                        else f"{title}: {error or 'failed'}")})
+    log_info(f"3D asset '{title}' " + (f"ready at {local_url}" if local_url
+                                       else f"failed: {error}"))
+
+
+def esc_html(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def dismiss_widget(widget_id: str) -> str:
+    widget = active_widgets.pop(widget_id, None)
+    if not widget:
+        return f"No widget '{widget_id}' was on screen."
+    broadcast_event({"type": "widget_action", "action": "dismiss", "widget_id": widget_id})
+    return f"Dismissed '{widget['title']}'."
+
+
+def clear_all_widgets() -> str:
+    if not active_widgets:
+        return "The deck is already empty."
+    count = len(active_widgets)
+    active_widgets.clear()
+    broadcast_event({"type": "widget_action", "action": "clear_all"})
+    return f"Cleared {count} widget(s)."
+
+
+# Agent results are announced only in a gap in the conversation. Sending one
+# mid-turn starts a new turn, which cancels whatever FRIDAY is currently saying
+# — a finished visualisation would cut him off halfway through another answer.
+pending_agent_results = []          # (label, outcome) waiting for a quiet moment
+AGENT_RESULT_SETTLE_S = 0.75        # how long Live must stay quiet first
+
+
+def live_is_idle() -> bool:
+    return (global_live_session is not None
+            and not model_turn_active
+            and not model_is_speaking
+            and play_queue.empty())
+
+
+async def deliver_agent_result(label: str, outcome: str):
+    """Show the result in the GUI at once; speak it when there is a gap."""
+    broadcast_event({"type": "chat_log", "sender": "FRIDAY", "text": outcome, "style": "friday"})
+    pending_agent_results.append((label, outcome))
+
+
+async def agent_result_dispatcher():
+    """Announce finished agent work once FRIDAY has stopped talking."""
+    quiet_for = 0.0
+    tick = 0.25
+    while not shutdown_event.is_set():
+        await asyncio.sleep(tick)
+        if not pending_agent_results:
+            quiet_for = 0.0
+            continue
+        if not live_is_idle():
+            quiet_for = 0.0
+            continue
+        quiet_for += tick
+        if quiet_for < AGENT_RESULT_SETTLE_S:
+            continue
+
+        label, outcome = pending_agent_results.pop(0)
+        quiet_for = 0.0
+        try:
+            await global_live_session.send_client_content(
+                turns=[{"role": "user", "parts": [{"text":
+                    f"[Background {label} agent finished. Tell Vince this result now, in one short "
+                    f"spoken sentence, without mentioning agents or tools: {outcome}]"}]}],
+                turn_complete=True,
+            )
+        except Exception as e:
+            log_info(f"Could not deliver agent result to the live session: {e}")
+
+
+def _parse_tool_json(raw, default):
+    """Lenient JSON parser for LLM tool args: tolerates code fences, trailing
+    commas, single quotes / Python literals, or already-structured values."""
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, (list, dict)):
+        return raw
+    s = str(raw).strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9]*\s*", "", s)
+        s = re.sub(r"```\s*$", "", s)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    no_trailing = re.sub(r",\s*([}\]])", r"\1", s)
+    try:
+        return json.loads(no_trailing)
+    except json.JSONDecodeError:
+        pass
+    try:
+        import ast
+        val = ast.literal_eval(s)
+        if isinstance(val, (list, dict)):
+            return val
+    except (ValueError, SyntaxError):
+        pass
+    raise ValueError(
+        f"invalid JSON near: '{s[:120]}...'. Re-emit STRICT JSON: double quotes only, "
+        "no trailing commas, no comments, no markdown fences. If the scene is large, "
+        "create it with fewer objects first and add the rest via update_3d_scene."
+    )
+
+async def execute_tool(name: str, args: dict) -> tuple:
+    """Shared tool dispatcher for both the Gemini Live session and local models.
+    Returns (result_text, image_bytes_or_None); image is a capture the caller
+    should feed into its model's visual context."""
+    global camera_stream_active, screen_stream_active
+    loop = asyncio.get_running_loop()
+    args = args or {}
+    result = ""
+    image = None
+
+    if name in ("execute_shell_command", "execute_applescript_task") and remote_ws_clients:
+        # Remote session active: command must be approved on a connected device
+        # before touching the machine. Deterministic gate — not model-mediated.
+        preview = args.get("command") or args.get("script") or ""
+        approved = await request_exec_approval(name, str(preview)[:500])
+        log_interaction("remote_exec_approval", {"tool": name, "approved": approved, "preview": str(preview)[:100]})
+        if not approved:
+            return ("[Blocked]: A remote session is active and this command was not approved "
+                    "on Vince's device (denied or timed out). It was NOT executed. "
+                    "Tell the user approval is required on screen.", None)
+
+    if name == "execute_shell_command":
+        result = await loop.run_in_executor(None, sentry_exec.execute_shell, args.get("command", ""))
+    elif name == "execute_applescript_task":
+        result = await loop.run_in_executor(None, sentry_exec.execute_applescript, args.get("script", ""))
+    elif name == "look_at_screen":
+        display_sel = args.get("display", "active")
+        image = await loop.run_in_executor(None, sentry_vision.capture_screen, display_sel)
+        if image:
+            result = (
+                f"Screen captured (mode: {display_sel}) and loaded into your visual sensor. "
+                f"{sentry_vision.describe_displays()} "
+                "Click coordinates (0-1000) now map onto exactly this captured area. "
+                "Tell the user what is on the screen."
+            )
+        else:
+            result = "Error: Failed to capture screen. Verify Screen Recording permissions."
+    elif name == "look_at_webcam":
+        source = (args.get("source") or "auto").lower()
+        if source != "mac" and remote_session_active():
+            image = latest_remote_frame_bytes if remote_frame_fresh() else None
+            if image:
+                result = "Phone camera frame captured (Vince's remote session) and loaded into your visual sensor. Tell the user what you see."
+            else:
+                result = ("Vince is connected from his phone but no phone camera frame is available yet. "
+                          "Ask him to tap the Camera button on his phone (or say 'use the Mac camera' to force the laptop webcam).")
+        else:
+            image = await loop.run_in_executor(None, sentry_vision.capture_webcam)
+            if image:
+                result = "Mac webcam frame captured successfully and loaded into your visual sensor. Tell the user what you see."
+            else:
+                result = "Error: Failed to capture webcam. Verify camera access permissions."
+    elif name == "start_camera_stream":
+        camera_source["mode"] = "mac" if (args.get("source") or "auto").lower() == "mac" else "auto"
+        camera_stream_active = True
+        broadcast_event({"type": "sense_update", "camera_active": True, "screen_active": screen_stream_active})
+        src_note = "Mac webcam (forced)" if camera_source["mode"] == "mac" else \
+            ("phone camera" if remote_session_active() else "Mac webcam")
+        result = f"Camera streaming started using the {src_note}. Reason: '{args.get('reason', '')}'."
+    elif name == "stop_camera_stream":
+        camera_stream_active = False
+        camera_source["mode"] = "auto"
+        broadcast_event({"type": "sense_update", "camera_active": False, "screen_active": screen_stream_active})
+        result = "Camera streaming stopped."
+    elif name == "start_screen_stream":
+        screen_stream_active = True
+        broadcast_event({"type": "sense_update", "camera_active": camera_stream_active, "screen_active": True})
+        result = f"Screen continuous capture started. Reason: '{args.get('reason', '')}'."
+    elif name == "stop_screen_stream":
+        screen_stream_active = False
+        broadcast_event({"type": "sense_update", "camera_active": camera_stream_active, "screen_active": False})
+        result = "Screen continuous capture stopped."
+    elif name == "register_person":
+        result = await loop.run_in_executor(None, register_person, args.get("name", "Unknown"))
+    elif name == "identify_current_user":
+        result = await loop.run_in_executor(None, identify_current_user)
+    elif name == "save_memory_fact":
+        key = args.get("key")
+        val = args.get("value")
+        memory = load_memory()
+        memory[key] = val
+        save_memory(memory)
+        result = f"Fact saved: '{key}' is now remembered as '{val}'."
+    elif name == "retrieve_memory_facts":
+        result = json.dumps(load_memory(), ensure_ascii=False)
+    elif name == "create_3d_scene":
+        try:
+            objects = _parse_tool_json(args.get("objects_json"), [])
+            environment = _parse_tool_json(args.get("environment_json"), {})
+            result = sentry_scene.manager.create_scene(args.get("name", "Untitled"), objects, environment)
+        except ValueError as e:
+            log_interaction("scene_json_parse_error", {"raw_preview": str(args.get("objects_json"))[:300]})
+            result = f"[Error]: objects_json: {e}"
+    elif name == "update_3d_scene":
+        try:
+            operations = _parse_tool_json(args.get("operations_json"), [])
+            result = sentry_scene.manager.update_scene(args.get("scene", ""), operations)
+        except ValueError as e:
+            log_interaction("scene_json_parse_error", {"raw_preview": str(args.get("operations_json"))[:300]})
+            result = f"[Error]: operations_json: {e}"
+    elif name == "delete_3d_scene":
+        result = sentry_scene.manager.delete_scene(args.get("scene", ""))
+    elif name == "list_3d_scenes":
+        result = sentry_scene.manager.list_scenes()
+    elif name == "inspect_3d_scene":
+        result = sentry_scene.manager.describe_scene(args.get("scene", ""))
+    elif name == "fetch_webpage":
+        result = await sentry_web.fetch_webpage(args.get("url"))
+    elif name == "computer_click":
+        result = await loop.run_in_executor(
+            None, sentry_action.click,
+            int(args.get("x", 500)), int(args.get("y", 500)),
+            args.get("button", "left"), int(args.get("clicks", 1))
+        )
+    elif name == "computer_type":
+        result = await loop.run_in_executor(
+            None, sentry_action.type_text,
+            args.get("text", ""), bool(args.get("press_enter", False))
+        )
+    elif name == "computer_press_keys":
+        result = await loop.run_in_executor(None, sentry_action.press_keys, list(args.get("keys", [])))
+    elif name == "computer_scroll":
+        x = args.get("x")
+        y = args.get("y")
+        result = await loop.run_in_executor(
+            None, sentry_action.scroll,
+            int(args.get("amount", -5)),
+            int(x) if x is not None else None,
+            int(y) if y is not None else None
+        )
+    elif name == "computer_drag":
+        result = await loop.run_in_executor(
+            None, sentry_action.drag,
+            int(args.get("x1", 0)), int(args.get("y1", 0)),
+            int(args.get("x2", 0)), int(args.get("y2", 0))
+        )
+    elif name == "read_ui_elements":
+        result = await loop.run_in_executor(None, sentry_action.read_ui_elements)
+    elif name == "list_open_windows":
+        result = await loop.run_in_executor(None, sentry_vision.list_open_windows)
+    elif name == "get_calendar_events":
+        result = await loop.run_in_executor(
+            None, sentry_personal.get_calendar_events,
+            int(args.get("days_ahead", 7)), int(args.get("days_back", 0))
+        )
+    elif name == "create_calendar_event":
+        result = await loop.run_in_executor(
+            None, sentry_personal.create_calendar_event,
+            args.get("title", "Untitled"), args.get("start_iso", ""),
+            int(args.get("duration_minutes", 60)), args.get("notes", "")
+        )
+    elif name == "get_recent_emails":
+        result = await loop.run_in_executor(
+            None, sentry_personal.get_recent_emails, int(args.get("count", 10))
+        )
+    elif name == "search_emails":
+        result = await loop.run_in_executor(
+            None, sentry_personal.search_emails,
+            args.get("query", ""), int(args.get("count", 8))
+        )
+    elif name == "create_skeleton_widget":
+        result = create_skeleton_widget(args.get("widget_id", ""), args.get("title", ""),
+                                        args.get("query_context", ""))
+    elif name == "generate_spatial_3d_asset":
+        result = generate_spatial_3d_asset(args.get("prompt", ""),
+                                           args.get("widget_id", ""),
+                                           args.get("title", ""))
+    elif name == "list_3d_assets":
+        result = list_3d_assets()
+    elif name == "show_3d_view":
+        result = show_3d_view(args.get("target", ""))
+    elif name == "show_3d_asset":
+        result = show_3d_asset(args.get("query", ""), args.get("widget_id", ""))
+    elif name == "dismiss_widget":
+        result = dismiss_widget(args.get("widget_id", ""))
+    elif name == "clear_all_widgets":
+        result = clear_all_widgets()
+    elif name == "dispatch_agent":
+        result = dispatch_background_agent(
+            str(args.get("goal", "")).strip(),
+            str(args.get("tier", agents.DEFAULT_TIER)),
+        )
+    elif name == "shutdown_friday":
+        request_shutdown("assistant was asked to shut down")
+        result = "Shutting down the Project FRIDAY system. Goodbye!"
+    else:
+        result = f"Unknown function: {name}"
+
+    return result, image
+
+
+TOOL_FUNCTION_DECLARATIONS = [
+                    {
+                        "name": "execute_shell_command",
+                        "description": "Execute a local shell command on macOS and return its output.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "command": {
+                                    "type": "STRING",
+                                    "description": "The shell/bash command to run."
+                                }
+                            },
+                            "required": ["command"]
+                        }
+                    },
+                    {
+                        "name": "execute_applescript_task",
+                        "description": "Execute macOS AppleScript code to control native applications, window management, or system settings.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "script": {
+                                    "type": "STRING",
+                                    "description": "The AppleScript code to run."
+                                }
+                            },
+                            "required": ["script"]
+                        }
+                    },
+                    {
+                        "name": "look_at_screen",
+                        "description": "Capture a screenshot and load it into your visual sensor. By default captures the ACTIVE display — the monitor where the user's mouse cursor currently is (usually where they are working). The user may have multiple monitors: pass display='all' to see every monitor at once, or a display number ('1', '2') for a specific one. If the user says you're looking at the wrong screen, try display='all' first to locate their work, then capture that display number.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "display": {
+                                    "type": "STRING",
+                                    "description": "'active' (default, monitor with mouse), 'all' (composite of all monitors), or a display number like '1' or '2'."
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "name": "look_at_webcam",
+                        "description": "Capture a single camera frame and load it into your visual sensor. Use this when the user asks you to look at them, check the camera feed, or see their physical surroundings. When Vince is connected remotely from his phone, this automatically uses his PHONE camera; pass source='mac' only if he explicitly asks for the laptop/Mac webcam.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "source": {
+                                    "type": "STRING",
+                                    "description": "'auto' (default: phone camera during a remote session, else Mac webcam) or 'mac' to force the Mac's webcam."
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "name": "start_camera_stream",
+                        "description": "Start continuous real-time camera streaming. Use this when you decide you need to watch the user, check their movements, recognize their face, or see what they are doing in real-time. When Vince is connected remotely from his phone, this automatically streams his PHONE camera; pass source='mac' only if he explicitly asks for the laptop/Mac webcam.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "reason": {
+                                    "type": "STRING",
+                                    "description": "The reason why you need to enable the camera feed."
+                                },
+                                "source": {
+                                    "type": "STRING",
+                                    "description": "'auto' (default: phone camera during a remote session, else Mac webcam) or 'mac' to force the Mac's webcam."
+                                }
+                            },
+                            "required": ["reason"]
+                        }
+                    },
+                    {
+                        "name": "stop_camera_stream",
+                        "description": "Stop the continuous webcam video stream. Call this when you no longer need to watch the user, or when they ask you to turn off the camera.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "start_screen_stream",
+                        "description": "Start continuous real-time streaming of the screen captures. Use this when you need to watch their display activities, code editor updates, or work progress in real-time.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "reason": {
+                                    "type": "STRING",
+                                    "description": "The reason why you need to enable the screen feed."
+                                }
+                            },
+                            "required": ["reason"]
+                        }
+                    },
+                    {
+                        "name": "stop_screen_stream",
+                        "description": "Stop the continuous screen capture stream. Call this when you no longer need to monitor their display.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "register_person",
+                        "description": "Register a new person in your local database. Captures their face signature and voice signature, and saves them under their name.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "name": {
+                                    "type": "STRING",
+                                    "description": "The name of the person being registered (e.g. 'Vince', 'Anu')."
+                                }
+                            },
+                            "required": ["name"]
+                        }
+                    },
+                    {
+                        "name": "identify_current_user",
+                        "description": "Analyze the active audio buffer (voice signature) and camera frames (face signature) to identify who is speaking or in front of the computer. Returns their name if registered.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "save_memory_fact",
+                        "description": "Save a key-value fact, preference, or detail about the user (e.g. user_name, user_hobbies, facts to remember) to persistent memory. Use this whenever the user asks you to remember something.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "key": {
+                                    "type": "STRING",
+                                    "description": "The name/category of the fact (e.g. 'user_name', 'favorite_food')."
+                                },
+                                "value": {
+                                    "type": "STRING",
+                                    "description": "The detail/fact content to save."
+                                }
+                            },
+                            "required": ["key", "value"]
+                        }
+                    },
+                    {
+                        "name": "retrieve_memory_facts",
+                        "description": "Retrieve all facts, preferences, and details saved in your persistent memory.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "create_3d_scene",
+                        "description": "Create a live, persistent, interactive 3D scene in the Spatial workspace (renders instantly in the GUI and stays active). Use for ANY visualization request: astronomy, anatomy, architecture, flowcharts, networks, timelines, physics, molecules, data. Build scenes from primitive objects. objects_json is a JSON array of objects: {id, type (sphere|box|cylinder|cone|torus|ring|plane|line|text|points|group|arrow|capsule), position [x,y,z], rotation, scale, color '#hex', opacity, emissive, wireframe, label, parent (group id), size {radius|width|height|depth|tube|innerRadius|outerRadius}, points [[x,y,z],...] for line, text for text nodes, count+spread for points, animation {type: orbit|spin|pulse|bounce, speed, radius, center, axis}}. Give every meaningful object a human id ('sun', 'left_ventricle') and label. NEVER create a new scene for edits to an existing one — use update_3d_scene.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "name": {"type": "STRING", "description": "Scene name shown in the workspace, e.g. 'Solar System'."},
+                                "objects_json": {"type": "STRING", "description": "JSON array of object specs (see tool description)."},
+                                "environment_json": {"type": "STRING", "description": "Optional JSON: {background '#hex', grid bool, stars bool, ambient 0-3, camera {position [x,y,z], target [x,y,z]}}."}
+                            },
+                            "required": ["name", "objects_json"]
+                        }
+                    },
+                    {
+                        "name": "update_3d_scene",
+                        "description": "Edit an EXISTING live scene with object-level operations — never recreate a scene to change it. operations_json is a JSON array of ops: {action:'add', object:{...}} | {action:'update', id, changes:{any object fields}} | {action:'remove', id} | {action:'highlight'|'unhighlight'|'hide'|'show', id} | {action:'camera', camera:{position,target}} | {action:'environment', environment:{...}} | {action:'explode', factor} | {action:'style', mode:'wireframe'|'solid'}. Examples: rotate object = update rotation; make transparent = update opacity; zoom into X = camera op targeting X's position.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "scene": {"type": "STRING", "description": "Scene name or id."},
+                                "operations_json": {"type": "STRING", "description": "JSON array of operations (see tool description)."}
+                            },
+                            "required": ["scene", "operations_json"]
+                        }
+                    },
+                    {
+                        "name": "delete_3d_scene",
+                        "description": "Remove a scene from the Spatial workspace. Only when the user asks to close/delete it.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "scene": {"type": "STRING", "description": "Scene name or id."}
+                            },
+                            "required": ["scene"]
+                        }
+                    },
+                    {
+                        "name": "list_3d_scenes",
+                        "description": "List all active scenes in the Spatial workspace with their object ids and the user's current selection.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "inspect_3d_scene",
+                        "description": "Get the full JSON state of one scene (all objects with positions, colors, animations). Use before editing if unsure of current object ids or state.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "scene": {"type": "STRING", "description": "Scene name or id."}
+                            },
+                            "required": ["scene"]
+                        }
+                    },
+                    {
+                        "name": "fetch_webpage",
+                        "description": "Fetch a specific URL from the internet and return its readable text content. Use this after google_search to read full articles, documentation, or any page the user asks about.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "url": {
+                                    "type": "STRING",
+                                    "description": "The full http(s) URL to fetch."
+                                }
+                            },
+                            "required": ["url"]
+                        }
+                    },
+                    {
+                        "name": "computer_click",
+                        "description": "Click the mouse at a position on screen. Coordinates are NORMALIZED 0-1000 relative to the full screen (as seen in your latest screenshot: x=0 left edge, x=1000 right edge, y=0 top, y=1000 bottom). ALWAYS call look_at_screen first to see the current screen, then click. After clicking, call look_at_screen again to verify the result.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "x": {"type": "INTEGER", "description": "Normalized horizontal position 0-1000."},
+                                "y": {"type": "INTEGER", "description": "Normalized vertical position 0-1000."},
+                                "button": {"type": "STRING", "description": "'left' (default), 'right', or 'middle'."},
+                                "clicks": {"type": "INTEGER", "description": "1 = single click (default), 2 = double click."}
+                            },
+                            "required": ["x", "y"]
+                        }
+                    },
+                    {
+                        "name": "computer_type",
+                        "description": "Type text with the keyboard into the currently focused field. Click the target field first with computer_click.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "text": {"type": "STRING", "description": "The text to type."},
+                                "press_enter": {"type": "BOOLEAN", "description": "Press Enter after typing (default false)."}
+                            },
+                            "required": ["text"]
+                        }
+                    },
+                    {
+                        "name": "computer_press_keys",
+                        "description": "Press a keyboard key or hotkey combo, e.g. ['enter'], ['command','c'], ['command','space'], ['command','tab'].",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "keys": {
+                                    "type": "ARRAY",
+                                    "items": {"type": "STRING"},
+                                    "description": "Keys pressed together. Modifiers: command, option, ctrl, shift."
+                                }
+                            },
+                            "required": ["keys"]
+                        }
+                    },
+                    {
+                        "name": "computer_scroll",
+                        "description": "Scroll the mouse wheel. Positive amount scrolls up, negative scrolls down. Optionally give a normalized 0-1000 position to scroll over.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "amount": {"type": "INTEGER", "description": "Scroll units. e.g. -5 scrolls down a bit."},
+                                "x": {"type": "INTEGER", "description": "Optional normalized x to hover before scrolling."},
+                                "y": {"type": "INTEGER", "description": "Optional normalized y to hover before scrolling."}
+                            },
+                            "required": ["amount"]
+                        }
+                    },
+                    {
+                        "name": "computer_drag",
+                        "description": "Drag with the left mouse button from one normalized 0-1000 coordinate to another (move windows, select text, sliders).",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "x1": {"type": "INTEGER", "description": "Start normalized x."},
+                                "y1": {"type": "INTEGER", "description": "Start normalized y."},
+                                "x2": {"type": "INTEGER", "description": "End normalized x."},
+                                "y2": {"type": "INTEGER", "description": "End normalized y."}
+                            },
+                            "required": ["x1", "y1", "x2", "y2"]
+                        }
+                    },
+                    {
+                        "name": "read_ui_elements",
+                        "description": "Read the accessibility UI element tree of the frontmost application: buttons, fields, menus with their names and REAL pixel positions plus the screen size. More precise than a screenshot for finding exact click targets in native macOS apps.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "list_open_windows",
+                        "description": "List all open windows across ALL monitors and virtual desktops (Spaces): app name, window title, and which display each is on, plus windows on hidden desktops. Use this when the user mentions an app/window you can't see in the screenshot, or to find where their work actually is. Windows on other desktops can't be captured until brought forward — activate the app first, then look_at_screen.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "get_calendar_events",
+                        "description": "Read the user's calendar events (all accounts configured on this Mac: iCloud, Google, Exchange). Use for questions about schedule, meetings, availability, or upcoming events.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "days_ahead": {"type": "INTEGER", "description": "How many days ahead to include (default 7)."},
+                                "days_back": {"type": "INTEGER", "description": "How many past days to include (default 0)."}
+                            }
+                        }
+                    },
+                    {
+                        "name": "create_calendar_event",
+                        "description": "Create a new event in the user's default calendar. Always confirm title and time with the user before creating.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "title": {"type": "STRING", "description": "Event title."},
+                                "start_iso": {"type": "STRING", "description": "Start time as 'YYYY-MM-DD HH:MM' (24h, local time)."},
+                                "duration_minutes": {"type": "INTEGER", "description": "Duration in minutes (default 60)."},
+                                "notes": {"type": "STRING", "description": "Optional notes/description."}
+                            },
+                            "required": ["title", "start_iso"]
+                        }
+                    },
+                    {
+                        "name": "get_recent_emails",
+                        "description": "Read the most recent emails from the user's inbox (Apple Mail): sender, subject, unread status, and a short preview of each.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "count": {"type": "INTEGER", "description": "Number of recent emails to fetch (default 10, max 25)."}
+                            }
+                        }
+                    },
+                    {
+                        "name": "search_emails",
+                        "description": "Search recent inbox emails by sender or subject text (Apple Mail).",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "query": {"type": "STRING", "description": "Text to match against sender or subject."},
+                                "count": {"type": "INTEGER", "description": "Max results (default 8)."}
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                    {
+                        "name": "list_3d_assets",
+                        "description": (
+                            "List the 3D models already generated and saved on disk, newest "
+                            "first. Check here before generating: re-showing a saved model is "
+                            "instant and free, while generating costs a credit and a minute."
+                        ),
+                        "parameters": {"type": "OBJECT", "properties": {}}
+                    },
+                    {
+                        "name": "show_3d_view",
+                        "description": (
+                            "Switch which 3D surface is on screen. The 3D tab holds the spatial "
+                            "scene and every generated model side by side but shows ONE at a time, "
+                            "so this is the only way to change the selection. Pass 'spatial' (or "
+                            "'scene') for the SVE scene, or a model's name to bring that model up. "
+                            "Use it whenever Vince says 'switch to', 'go back to', or 'show me the "
+                            "... instead'."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "target": {
+                                    "type": "STRING",
+                                    "description": "'spatial' for the SVE scene, or words naming a generated model, e.g. 'jet engine'."
+                                }
+                            },
+                            "required": ["target"]
+                        }
+                    },
+                    {
+                        "name": "show_3d_asset",
+                        "description": (
+                            "Put an already-generated 3D model back on screen. Instant and free — "
+                            "no API call. Use whenever Vince refers to a model made earlier "
+                            "('show me that drone again', 'bring back the jet engine'). Matches on "
+                            "title and on the prompt it was built from."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "query": {
+                                    "type": "STRING",
+                                    "description": "Words identifying the saved model, e.g. 'jet engine'. Omit for the most recent."
+                                },
+                                "widget_id": {
+                                    "type": "STRING",
+                                    "description": "Optional stable card id."
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "name": "generate_spatial_3d_asset",
+                        "description": (
+                            "Generate ONE photoreal, textured 3D object (.glb) from a description "
+                            "and mount it in the deck, orbitable by hand. Use this when Vince wants "
+                            "to SEE a real thing — a drone, an engine part, a piece of furniture, a "
+                            "prop. It returns INSTANTLY; the model renders into the card up to a "
+                            "minute later, so keep talking and never wait for it. This is NOT for "
+                            "diagrams: anything structural, labelled or editable — molecules, orbits, "
+                            "flowcharts, networks, anatomy, data — belongs in a 3D scene via "
+                            "dispatch_agent tier 'spatial', which is instant, free and can be "
+                            "updated afterwards. Each call costs an API credit, so one asset per ask."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "prompt": {
+                                    "type": "STRING",
+                                    "description": (
+                                        "Vivid, concrete description of the single object, including "
+                                        "material and finish. E.g. 'vintage brass astrolabe with "
+                                        "engraved rings, studio lighting'. Describe one object, not a "
+                                        "scene or an arrangement."
+                                    )
+                                },
+                                "widget_id": {
+                                    "type": "STRING",
+                                    "description": "Stable id for the subject, e.g. 'drone_model'. Reuse it to replace that card."
+                                },
+                                "title": {
+                                    "type": "STRING",
+                                    "description": "Card header, e.g. 'Recon Drone'."
+                                }
+                            },
+                            "required": ["prompt"]
+                        }
+                    },
+                    {
+                        "name": "create_skeleton_widget",
+                        "description": (
+                            "Put a data card on screen. Use this for ANY answer carrying detail "
+                            "worth seeing — a quote, machine telemetry, a research briefing, a "
+                            "comparison. It returns INSTANTLY: the card appears as a loading "
+                            "skeleton and a background generator fills it in a few seconds later. "
+                            "So call it and keep talking; never wait, and never apologise for it "
+                            "loading. Reuse a widget_id to replace that card's contents."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "widget_id": {
+                                    "type": "STRING",
+                                    "description": "Stable id for the subject, e.g. 'goog_quote' or 'sysmon'."
+                                },
+                                "title": {
+                                    "type": "STRING",
+                                    "description": "Card header, e.g. 'Alphabet Inc.'."
+                                },
+                                "query_context": {
+                                    "type": "STRING",
+                                    "description": (
+                                        "Everything the generator needs, in detail — it cannot see the "
+                                        "conversation. Name the subject, every figure or section the card "
+                                        "should carry, and any values you already know. E.g. 'Live GOOG "
+                                        "quote: price, day change and percent, open/high/low, market cap, "
+                                        "P/E, 52-week range, intraday trend chart, one-line sentiment.' "
+                                        "Thin context makes a thin card."
+                                    )
+                                }
+                            },
+                            "required": ["widget_id", "title", "query_context"]
+                        }
+                    },
+                    {
+                        "name": "dismiss_widget",
+                        "description": "Remove one widget from the deck when Vince is done with it.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "widget_id": {"type": "STRING", "description": "The widget to remove."}
+                            },
+                            "required": ["widget_id"]
+                        }
+                    },
+                    {
+                        "name": "clear_all_widgets",
+                        "description": "Empty the whole deck and return the orb to centre screen.",
+                        "parameters": {"type": "OBJECT", "properties": {}}
+                    },
+                    {
+                        "name": "dispatch_agent",
+                        "description": (
+                            "Hand a complex, multi-step task to a background agent and return "
+                            "IMMEDIATELY. Use this whenever a request needs several tool calls, "
+                            "verification loops, or heavy OS work: multi-step macOS automation, "
+                            "long AppleScript/shell sequences, operating the GUI, or building and "
+                            "editing a 3D scene. Speak a one-line acknowledgement such as 'Working "
+                            "on that now.' in the SAME turn you call this. The result is delivered "
+                            "to you when the agent finishes and you announce it then. Do NOT use "
+                            "this for a single quick tool call or anything you can answer directly."
+                        ),
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "goal": {
+                                    "type": "STRING",
+                                    "description": "The complete task, self-contained. The agent runs without "
+                                                   "further input and cannot ask questions, so include every "
+                                                   "detail it needs."
+                                },
+                                "tier": {
+                                    "type": "STRING",
+                                    "enum": ["os", "spatial"],
+                                    "description": "'os' for macOS automation, shell, AppleScript and GUI control. "
+                                                   "'spatial' for building or editing 3D SVE scenes. Default 'os'."
+                                }
+                            },
+                            "required": ["goal"]
+                        }
+                    },
+                    {
+                        "name": "shutdown_friday",
+                        "description": "Gracefully shut down the Project FRIDAY assistant and exit the program. Use this when the user says goodbye, quit, exit, or asks you to turn off.",
+                        "parameters": {
+                            "type": "OBJECT",
+                            "properties": {}
+                        }
+                    }
+]
+
+async def receive_audio_task(session, session_disconnect_event):
+    global camera_stream_active, screen_stream_active, model_is_speaking, model_turn_active
+    try:
+        # session.receive() yields ONE conversational turn and then ends. Without
+        # this outer loop the task falls through after the first reply, the session
+        # is torn down, and the reconnect resumes a handle whose last turn is replayed
+        # — which re-fires that turn's tool calls on every rotation.
+        while not (shutdown_event.is_set() or session_disconnect_event.is_set()):
+            async for message in session.receive():
+                if shutdown_event.is_set() or session_disconnect_event.is_set():
+                    break
+                try:
+                    # 0. Handle GoAway Signal (proactive session rotation before 1008 timeout)
+                    if message.go_away:
+                        time_left = getattr(message.go_away, "time_left", None)
+                        log_info(f"Received GoAway from Gemini API (time left: {time_left}). Gracefully closing to rotate/resume session...")
+                        session_disconnect_event.set()
+                        return
+
+                    # 1. Interruption (Barge-In)
+                    if message.server_content and message.server_content.interrupted:
+                        set_system_status("Listening (Interrupted)")
+                        interrupted_event.set()
+                        model_is_speaking = False
+                        while not play_queue.empty():
+                            try:
+                                play_queue.get_nowait()
+                                play_queue.task_done()
+                            except asyncio.QueueEmpty:
+                                break
+                        await asyncio.sleep(0.05)
+                        interrupted_event.clear()
+                        model_turn_active = False
+                        broadcast_event({"type": "interrupted"})
+                        log_interaction("user_interruption", {})
+                        continue
+
+                    # 2. Audio Output
+                    if message.server_content and message.server_content.model_turn:
+                        for part in message.server_content.model_turn.parts:
+                            if part.inline_data:
+                                set_system_status("Speaking")
+                                model_turn_active = True
+                                audio_data = part.inline_data.data
+                                await play_queue.put(audio_data)
+                                pcm_b64 = base64.b64encode(audio_data).decode('utf-8')
+                                broadcast_event({"type": "audio_out", "pcm_base64": pcm_b64})
+                            if part.text:
+                                broadcast_event({"type": "chat_log", "sender": "FRIDAY", "text": part.text, "style": "friday"})
+
+                    # Reset status to Listening when turn finishes
+                    if message.server_content and message.server_content.turn_complete:
+                        model_turn_active = False
+                        set_system_status("Listening")
+
+                    # 3. Handle Session Resumption (Silent log)
+                    if message.session_resumption_update:
+                        update = message.session_resumption_update
+                        if update.resumable and update.new_handle:
+                            save_session_handle(update.new_handle)
+
+                    # 4. Handle OS Execution Tool Calls
+                    if message.tool_call:
+                        function_responses = []
+                        for fc in message.tool_call.function_calls:
+                            set_system_status(f"Executing {fc.name}")
+                            log_info(f"Tool call: {fc.name}")
+                            broadcast_event({
+                                "type": "tool_activity",
+                                "phase": "start",
+                                "name": fc.name,
+                                "args_preview": json.dumps(dict(fc.args or {}))[:220]
+                            })
+                            log_interaction("tool_call_received", {"name": fc.name, "args": fc.args})
+
+                            # A raising tool must still produce a response. Skipping
+                            # send_tool_response leaves the turn open forever, and the
+                            # model re-issues the same calls on every later resume.
+                            try:
+                                result, tool_image = await execute_tool(fc.name, dict(fc.args or {}))
+                                if tool_image:
+                                    await session.send_realtime_input(
+                                        video=types.Blob(data=tool_image, mime_type="image/jpeg")
+                                    )
+                            except Exception as tool_err:
+                                result = f"[Tool error] {fc.name} failed: {tool_err}"
+                                log_info(result)
+                                log_interaction("tool_call_failed", {"name": fc.name, "error": str(tool_err)})
+
+                            log_info(f"Result: {str(result)[:50]}...")
+                            broadcast_event({
+                                "type": "tool_activity",
+                                "phase": "done",
+                                "name": fc.name,
+                                "result_preview": str(result)[:300]
+                            })
+                            log_interaction("tool_call_executed", {"name": fc.name, "output_preview": str(result)[:100]})
+                        
+                            function_responses.append(types.FunctionResponse(
+                                id=fc.id,
+                                name=fc.name,
+                                response={"output": result}
+                            ))
+                    
+                        if function_responses:
+                            await session.send_tool_response(function_responses=function_responses)
+
+                except Exception as e:
+                    log_info(f"Error in receive message: {e}")
+            
+    except Exception as e:
+        if not shutdown_event.is_set():
+            log_info(f"Receive stream error / ended: {e}")
+    finally:
+        session_disconnect_event.set()
+
+
+IMAGE_MAX_BYTES = 6 * 1024 * 1024
+_image_cache = {}          # url -> (bytes, content_type)
+
+MODEL_MAX_BYTES = 64 * 1024 * 1024      # generated .glb files run to tens of MB
+ASSETS_DIR = os.path.join(DATA_DIR, "generated_assets")
+ASSETS_INDEX_FILE = os.path.join(DATA_DIR, "friday_assets.json")
+
+
+def _load_asset_index() -> list:
+    try:
+        with open(ASSETS_INDEX_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_asset_index(index: list):
+    try:
+        with open(ASSETS_INDEX_FILE, "w", encoding="utf-8") as f:
+            json.dump(index[:200], f, indent=2)
+    except OSError as e:
+        log_info(f"Could not write the asset index: {e}")
+
+
+async def _download_model(url: str) -> bytes:
+    """Fetch a generated .glb server-side.
+
+    This has to happen on our side rather than in the page: the CDN serves the
+    file without CORS headers, so the browser refuses it outright, and the URL
+    is signed and expires. Downloading once and keeping the bytes sidesteps both.
+    """
+    import aiohttp
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept": "model/gltf-binary,application/octet-stream,*/*",
+    }
+    connector = aiohttp.TCPConnector(ssl=False)
+    timeout = aiohttp.ClientTimeout(total=120)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector,
+                                     headers=headers) as session:
+        async with session.get(url) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"the model host answered HTTP {resp.status}")
+            # read(n) returns only what is already buffered, which silently
+            # truncates anything bigger than one chunk — iterate to EOF instead.
+            buf = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                buf.extend(chunk)
+                if len(buf) > MODEL_MAX_BYTES:
+                    raise RuntimeError("the model is larger than 64 MB")
+
+    body = bytes(buf)
+    if not body.startswith(b"glTF"):
+        raise RuntimeError("the downloaded file is not a .glb")
+    return body
+
+
+def save_generated_asset(prompt: str, title: str, body: bytes) -> dict:
+    """Write the .glb into generated_assets/ and record it in the index."""
+    os.makedirs(ASSETS_DIR, exist_ok=True)
+    slug = re.sub(r"[^a-z0-9]+", "_", (title or "asset").lower()).strip("_")[:40] or "asset"
+    # Content-addressed, so regenerating the same model never duplicates it.
+    digest = hashlib.sha1(body).hexdigest()[:8]
+    filename = f"{slug}_{digest}.glb"
+
+    with open(os.path.join(ASSETS_DIR, filename), "wb") as f:
+        f.write(body)
+
+    record = {"file": filename, "title": title, "prompt": prompt,
+              "bytes": len(body), "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+    index = [r for r in _load_asset_index() if r.get("file") != filename]
+    index.insert(0, record)
+    _save_asset_index(index)
+    log_info(f"Saved 3D asset to generated_assets/{filename} ({len(body)} bytes).")
+    return record
+
+
+async def start_gui_server():
+    """Serves web_gui over HTTP so ES modules (Three.js) load reliably."""
+    # pyrefly: ignore [missing-import]
+    from aiohttp import web
+    gui_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web_gui")
+
+    async def index(request):
+        return web.FileResponse(os.path.join(gui_dir, "index.html"))
+
+    async def image_proxy(request):
+        """Fetch a remote image and serve it from localhost.
+
+        News CDNs routinely answer a direct browser request with 403 hotlink
+        protection, so an <img src> pointing straight at them renders a broken
+        frame. Fetching server-side with a browser UA and the article's own
+        origin as Referer gets the bytes, and the page then loads them from us.
+        """
+        url = request.query.get("u", "")
+        if not url.lower().startswith(("http://", "https://")):
+            return web.Response(status=400, text="bad url")
+        cached = _image_cache.get(url)
+        if cached:
+            return web.Response(body=cached[0], content_type=cached[1])
+        try:
+            import aiohttp
+            from urllib.parse import urlsplit
+            origin = "{0.scheme}://{0.netloc}/".format(urlsplit(url))
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+                "Referer": origin,
+                "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+            }
+            connector = aiohttp.TCPConnector(ssl=False)
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector,
+                                             headers=headers) as session:
+                async with session.get(url) as resp:
+                    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                    if resp.status >= 400 or not ctype.startswith("image/"):
+                        return web.Response(status=404, text="not an image")
+                    body = await resp.content.read(IMAGE_MAX_BYTES + 1)
+            if len(body) > IMAGE_MAX_BYTES:
+                return web.Response(status=413, text="too large")
+            if len(_image_cache) > 60:
+                _image_cache.clear()
+            _image_cache[url] = (body, ctype)
+            return web.Response(body=body, content_type=ctype)
+        except Exception:
+            return web.Response(status=502, text="fetch failed")
+
+    @web.middleware
+    async def no_store_frontend(request, handler):
+        """Force the webview to revalidate the GUI assets on every load.
+
+        FileResponse sends ETag and Last-Modified but no Cache-Control. With
+        neither that nor Expires, WebKit falls back to *heuristic* freshness —
+        it treats a file that has not changed in a while as fresh for a fraction
+        of its age and serves it without ever asking us. In the desktop shell
+        that store also survives relaunch (private_mode=False), so an edited
+        stylesheet could keep rendering the old UI across restarts, with no way
+        to force a reload from inside the window. "no-cache" keeps the cache but
+        requires revalidation, so unchanged files still cost only a 304.
+        """
+        response = await handler(request)
+        if request.path != "/img":          # the image proxy is meant to cache
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
+    app = web.Application(middlewares=[no_store_frontend])
+    app.router.add_get("/", index)
+    app.router.add_get("/img", image_proxy)
+    # Saved .glb files, served same-origin so the loader can read them.
+    os.makedirs(ASSETS_DIR, exist_ok=True)
+    app.router.add_static("/assets", path=ASSETS_DIR)
+    app.router.add_static("/", path=gui_dir)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 8766)
+    await site.start()
+    log_info("GUI server listening on http://127.0.0.1:8766")
+    return runner
+
+async def run_session_tasks(session, input_stream):
+    global global_live_session
+    global_live_session = session
+    session_disconnect_event = asyncio.Event()
+
+    audio_in_task = asyncio.create_task(send_audio_task(session, input_stream, session_disconnect_event))
+    audio_out_task = asyncio.create_task(receive_audio_task(session, session_disconnect_event))
+    senses_task = asyncio.create_task(stream_senses_task(session, session_disconnect_event))
+
+    shutdown_waiter = asyncio.create_task(shutdown_event.wait())
+    disconnect_waiter = asyncio.create_task(session_disconnect_event.wait())
+
+    try:
+        done, pending = await asyncio.wait(
+            [shutdown_waiter, disconnect_waiter],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        for p in pending:
+            p.cancel()
+    finally:
+        session_disconnect_event.set()
+        audio_in_task.cancel()
+        audio_out_task.cancel()
+        senses_task.cancel()
+        await asyncio.gather(audio_in_task, audio_out_task, senses_task, return_exceptions=True)
+        global_live_session = None
+
+def build_system_instruction(memory_str: str) -> str:
+    return (
+        # --- Persona and the rule that governs every spoken word -------------
+        FRIDAY_SYSTEM_INSTRUCTION +
+        "The user is Vince (Vince Cyriac); everything below is about working with him. "
+
+        "HOW YOU SPEAK: default to under 10 words. Never read out tables, long number runs or "
+        "paragraphs aloud unless Vince explicitly asks you to explain verbally. No filler, no "
+        "preamble, no restating the question. English only. "
+        "THE ONE EXCEPTION: when you put a widget on screen, say one or two short sentences "
+        "carrying the key insight — never a bare 'Pulling up Apple.' and never silence. "
+        "Name the thing, then the single most useful takeaway: 'Displaying Google. GOOG is down "
+        "0.33% at $343.44 on heavy morning volume.' The widget carries the full breakdown; your "
+        "sentence carries the point of it. "
+        f"Persistent memory about Vince: {memory_str}. Use save_memory_fact to add to it. "
+
+        # --- The widget deck -------------------------------------------------
+        "WIDGETS: The screen is a vertical deck of live cards, newest on top. "
+        "create_skeleton_widget(widget_id, title, query_context) puts one up. It returns "
+        "instantly — the card appears as a loading skeleton and a background generator fills "
+        "in the charts and figures a few seconds later. So call it and carry straight on "
+        "talking: never wait for it, never say it is loading, never apologise for it. "
+        "dismiss_widget removes one; clear_all_widgets empties the deck. Reuse a stable "
+        "widget_id per subject so a second ask replaces that card rather than stacking. "
+
+        "WHEN TO PUT A CARD UP — be selective, an unwanted card is worse than none: "
+        "(1) Vince explicitly asks to see something: 'show me', 'pull up', 'display', 'open'. "
+        "(2) The answer is genuinely multi-dimensional and worth seeing: a live quote with its "
+        "chart and fundamentals, machine telemetry, a research briefing with several sources, a "
+        "comparison. "
+        "WHEN NOT TO: general questions, banter, 'what can you do', a single fact, a yes/no, a "
+        "quick lookup, anything you can answer in a sentence. Those are voice only. If in "
+        "doubt, just answer. "
+
+        "WRITING query_context IS THE WHOLE JOB. The generator cannot see this conversation — "
+        "it only receives that string. Name the subject, list every figure and section the card "
+        "should carry, and include any values you already know. 'Live GOOG quote: price, day "
+        "change and percent, open/high/low, market cap, P/E ratio, 52-week range, intraday "
+        "trend chart, one-line sentiment note.' A vague context produces a thin card. "
+
+        "3D scenes are different — those still go through dispatch_agent with tier 'spatial'. "
+
+        # --- Authority and safety -------------------------------------------
+        "Only Vince may run OS tasks, shell commands or AppleScript. If anyone else asks, refuse "
+        "politely. Never perform destructive actions (deleting files, sending messages or emails, "
+        "purchases) without confirming first. "
+        "REMOTE SESSIONS: Vince can connect from his phone; you get a system note when he does. "
+        "While remote, his phone mic and camera are the PRIMARY senses and camera tools default to "
+        "them. The Mac's webcam and screen belong to his unattended laptop — do not capture or "
+        "describe them unless he asks for the laptop specifically (then source='mac'). Shell and "
+        "AppleScript then need his on-screen approval; if one is blocked, say it awaits approval. "
+
+        # --- Senses -----------------------------------------------------------
+        "SENSES: start_camera_stream / start_screen_stream open a live feed, and the matching stop "
+        "tools close it. register_person and identify_current_user handle face and voice. "
+        "INTERNET: google_search to look things up, fetch_webpage to read a URL in full. For "
+        "current events, prices or weather, search first and answer from results — into a widget. "
+        "MULTI-MONITOR: look_at_screen defaults to the ACTIVE display. If what you see does not "
+        "match what he describes, capture display='all' (each monitor carries a red DISPLAY N "
+        "badge), identify the right one, then capture that number. If the app appears on no "
+        "monitor, call list_open_windows — it may be on a hidden desktop; activate it via "
+        "AppleScript, then capture again. Never describe his screen from memory. "
+        "PERSONAL DATA: get_calendar_events, create_calendar_event (confirm first), "
+        "get_recent_emails and search_emails. Put results in a widget rather than reading them out. "
+        "Only touch these when Vince raises them in the current request. "
+        "DESKTOP CONTROL: you can drive the Mac GUI. look_at_screen, locate the target in "
+        "normalized 0-1000 coordinates (or read_ui_elements for exact positions), act with "
+        "computer_click / computer_type / computer_press_keys / computer_scroll / computer_drag, "
+        "then look again to VERIFY before continuing. Prefer keyboard shortcuts when faster. "
+
+        # --- Delegation and 3D ------------------------------------------------
+        "DELEGATION: you are the voice and must stay responsive, so you never grind through long "
+        "work yourself. Dispatch to a background agent for anything multi-step or heavy: macOS "
+        "automation, long shell/AppleScript sequences, driving the GUI (tier 'os'), or building a "
+        "new 3D scene (tier 'spatial'). Call dispatch_agent with a complete self-contained goal and "
+        "say one short line in the same turn. Never say you cannot do it, never ask what to build. "
+        "The result comes back and you announce it in under 10 words. Quick things you do yourself: "
+        "a single tool call, a lookup, a widget update, a scene edit. "
+        "TWO KINDS OF 3D — pick deliberately. A single real OBJECT he wants to look at (a "
+        "drone, an engine part, a chair) is generate_spatial_3d_asset: photoreal, textured, "
+        "orbitable, takes up to a minute and costs a credit. Anything structural, labelled or "
+        "editable — molecules, orbits, flowcharts, networks, anatomy, data — is an SVE scene: "
+        "instant, free, and updatable afterwards. If it needs labels or later edits, it is a scene. "
+        "The 3D tab shows one surface at a time — scene or model. Changing which one is visible "
+        "is always show_3d_view; nothing else moves that selection, so never claim you "
+        "switched without calling it. "
+        "Generated models are saved to disk and persist across restarts: if he refers to one you "
+        "made before, use show_3d_asset (instant, free) rather than generating it again. "
+        "3D SCENES: building a new scene is always dispatch_agent tier 'spatial' — never "
+        "create_3d_scene yourself. Editing one already on stage ('rotate it', 'highlight X', 'hide "
+        "Y') is a direct update_3d_scene call. Scenes persist; never rebuild one to change it. "
+        "POINTING: Vince can point at scene objects by hand. You receive UI context notes naming "
+        "the object — when he says 'this' or 'it', he means that one. "
+
+        "If Vince says goodbye, quit or exit, invoke shutdown_friday. "
+        "Remember: under 10 words spoken, always. The widgets do the talking."
+    )
+
+
+async def run_friday():
+    global system_prompt_text
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+
+    # Graceful Ctrl+C / kill when the engine owns the main thread (CLI use).
+    # Relying on KeyboardInterrupt to surface through a busy loop is unreliable;
+    # a real signal handler always lands. In the desktop shell the engine runs in
+    # a worker thread, where this is a no-op — that shell installs its own.
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            main_loop.add_signal_handler(_sig, request_shutdown, _sig.name)
+        except (NotImplementedError, RuntimeError, ValueError, AttributeError):
+            pass
+
+    if not settings.gemini_api_key:
+        set_system_status("ERROR")
+        raise StartupError("GEMINI_API_KEY environment variable not set.")
+
+    set_system_status("Initializing Client")
+    client = gemini_client(settings)
+    # Held module-side on purpose: BaseApiClient.__del__ schedules an unguarded
+    # aclose() task, so letting the client be collected while the loop is still
+    # running leaves "Task was destroyed but it is pending" on every exit.
+    global genai_client
+    genai_client = client
+
+    set_system_status("Initializing Audio")
+    audio_system = pyaudio.PyAudio()
+    
+    try:
+        input_stream = audio_system.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=INPUT_RATE,
+            input=True,
+            frames_per_buffer=CHUNK_SIZE
+        )
+        output_stream = audio_system.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=OUTPUT_RATE,
+            output=True,
+            frames_per_buffer=CHUNK_SIZE
+        )
+    except Exception as e:
+        set_system_status("Audio Error")
+        audio_system.terminate()
+        raise StartupError(f"Failed to open audio: {e}") from e
+
+    # Start background servers & audio worker (persist across Gemini Live session reconnections)
+    gui_runner = await start_gui_server()
+    ws_server = await websockets.serve(ws_handler, "127.0.0.1", 8765)
+    log_info("WebSocket gateway listening on ws://127.0.0.1:8765")
+    playback_task = asyncio.create_task(play_audio_worker(output_stream))
+    telemetry_worker = asyncio.create_task(telemetry_task())
+    heartbeat_worker = asyncio.create_task(sentinel_heartbeat_task())
+    watcher_task = asyncio.create_task(shutdown_watcher())
+    agent_results_task = asyncio.create_task(agent_result_dispatcher())
+
+    # Load local persistent memory
+    memory = load_memory()
+    memory_str = json.dumps(memory, ensure_ascii=False) if memory else "No facts saved yet."
+
+    system_instruction_text = build_system_instruction(memory_str)
+    system_prompt_text = system_instruction_text
+
+    consecutive_failures = 0
+    # New process, new conversation: the handle starts empty and is only
+    # populated by this run's own session, for rotations within it.
+    clear_session_handle()
+
+    try:
+        while not shutdown_event.is_set():
+            previous_handle = current_session_handle
+
+            live_config = types.LiveConnectConfig(
+                response_modalities=[types.Modality.AUDIO],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                            voice_name=LIVE_VOICE
+                        )
+                    )
+                ),
+                system_instruction=types.Content(
+                    parts=[types.Part.from_text(text=system_instruction_text)]
+                ),
+                tools=[
+                    types.Tool(google_search=types.GoogleSearch()),
+                    types.Tool(function_declarations=TOOL_FUNCTION_DECLARATIONS),
+                ],
+                # No "transparent": that flag is Vertex / Agent Platform only, and
+                # the Developer API refuses the whole connection when it is set.
+                # Sent on every connect (handle=None just starts a fresh
+                # resumable session) to match the documented contract that this
+                # config is what asks the server for SessionResumptionUpdates.
+                session_resumption=types.SessionResumptionConfig(handle=previous_handle),
+            )
+
+            if previous_handle:
+                log_info("Resuming previous session handle...")
+
+            set_system_status("Connecting to API" if not previous_handle else "Resuming API Session")
+            log_interaction("connection_attempt", {"model": MODEL_ID, "resuming": previous_handle is not None})
+            
+            session_established = False
+            try:
+                async with client.aio.live.connect(model=MODEL_ID, config=live_config) as session:
+                    session_established = True
+                    set_system_status("Listening")
+                    log_interaction("connection_success", {"resumed": previous_handle is not None})
+                    consecutive_failures = 0
+
+                    await run_session_tasks(session, input_stream)
+
+            except Exception as e:
+                consecutive_failures += 1
+                log_interaction("connection_error", {"error": str(e), "established": session_established})
+                if previous_handle and not session_established:
+                    # The handshake itself was refused while resuming, so the
+                    # handle is stale/invalid — drop it and reconnect clean.
+                    log_info(f"Session resumption failed ({e}). Clearing handle and starting fresh...")
+                    clear_session_handle()
+                    await sleep_unless_shutdown(0.5)
+                else:
+                    # Either a cold-start failure or a live session that dropped.
+                    # A live session's handle is exactly what we need to resume
+                    # the rotation, so it is deliberately kept.
+                    set_system_status("Connection Failed")
+                    log_info(f"Live API error: {e}")
+                    backoff = min(10, 2 ** min(consecutive_failures, 3))
+                    log_info(f"Retrying connection in {backoff}s...")
+                    await sleep_unless_shutdown(backoff)
+
+            if not shutdown_event.is_set():
+                log_info("Gemini Live session ended. Rotating / resuming session...")
+                await sleep_unless_shutdown(0.2)
+
+    finally:
+        set_system_status("Shutting Down")
+
+        # 1. Stop everything that could still touch an audio device, and WAIT
+        #    for it — cancelling without awaiting used to race PyAudio teardown
+        #    against an in-flight output_stream.write().
+        for task in (playback_task, telemetry_worker, heartbeat_worker, watcher_task, agent_results_task):
+            task.cancel()
+        await asyncio.gather(playback_task, telemetry_worker, heartbeat_worker, watcher_task, agent_results_task,
+                             return_exceptions=True)
+
+        # 2. Stop accepting clients.
+        ws_server.close()
+        try:
+            await asyncio.wait_for(ws_server.wait_closed(), timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await gui_runner.cleanup()
+        except Exception:
+            pass
+
+        # 3. Release the API client's HTTP pool while the loop is still alive —
+        #    otherwise its aclose() is scheduled onto a loop that is about to
+        #    close, and never runs ("Task was destroyed but it is pending").
+        try:
+            await client._api_client.aclose()
+        except Exception:
+            pass
+
+        # 4. Devices last.
+        for stream in (input_stream, output_stream):
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+        try:
+            audio_system.terminate()
+        except Exception:
+            pass
+        print("Project FRIDAY engine terminated. Goodbye.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(run_friday())
+    except StartupError as e:
+        print(f"[FRIDAY Engine] Cannot start: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nProject FRIDAY terminated by user.")
+

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  FRIDAY sentinel — launchd agent for development on macOS.
+  Replace __REPO__, then:
+    cp deploy/launchd/com.friday.sentinel.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.friday.sentinel.plist
+  Stop with: launchctl bootout gui/$(id -u)/com.friday.sentinel
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.friday.sentinel</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO__/.venv/bin/python</string>
+    <string>-m</string>
+    <string>friday.sentinel</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__REPO__/data/logs/sentinel.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO__/data/logs/sentinel.log</string>
+</dict>
+</plist>

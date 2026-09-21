@@ -1,7 +1,7 @@
 # Project FRIDAY
 
 > **An Autonomous, Multimodal AI Desktop Assistant & Spatial Operating System for macOS**
-> Voice-first, Gemini-only. A holographic orb you talk to, a deck of live data widgets it composes for you, an interactive 3D spatial engine, and deep native OS control — with background agents doing the heavy lifting off the audio path.
+> Voice-first, Gemini-only. A holographic orb you talk to on the Mac, a deck of live data widgets it composes for you, an interactive 3D spatial engine, deep native OS control — and a headless **sentinel** daemon that runs 24/7 on a home server (Fedora x86_64 today, Raspberry Pi tomorrow) as the always-on event bus the desktop and future phone/WhatsApp bridges plug into.
 
 ---
 
@@ -99,6 +99,42 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
 
 ---
 
+## 🛰️ Multi-Node Architecture
+
+FRIDAY is one installable package, `friday`, split into three sub-packages with a hard boundary between them:
+
+- **`friday.core`** — everything every node shares: settings (`.env` + environment, per-role LLM routing), the SQLite/WAL store, event schemas, the cross-platform telemetry collector and the Gemini provider. Imports only stdlib + `psutil`, `aiohttp`, `python-dotenv`, `google-genai`. A test (`tests/test_boundaries.py`) imports every module in a poisoned interpreter and fails if anything macOS-only leaks in.
+- **`friday.desktop`** — the macOS node: the Gemini Live hub, the HUD, audio, Quartz vision, CGEvent automation, EventKit, biometrics. Unchanged in behaviour; it now reads paths and model ids from `core` and heartbeats to the sentinel when `FRIDAY_SENTINEL_URL` is set.
+- **`friday.sentinel`** — the headless 24/7 daemon. Identical code on macOS (`launchd`), Fedora and Raspberry Pi OS (`systemd`, `Type=notify` with a watchdog).
+
+### What the sentinel does
+
+- **Durable event queue.** `POST /events` writes to SQLite *before* returning `202`. WAL journaling means a power cut can never corrupt the main file; `synchronous=FULL` (default) means a committed event survives it. Anything left `processing` by a crash is requeued at the next boot.
+- **Handlers.** Each event is dispatched to every handler whose glob pattern matches its type (`node.*`, `telemetry.sample`, `*`). Delivery is at-least-once with three attempts, so handlers are idempotent upserts. Built-ins: heartbeat tracking, telemetry logging, and a log handler that marks where LLM triage plugs in.
+- **Telemetry.** CPU, load, memory, disk, uptime, thermal zones (psutil or raw sysfs) and power (battery, or Raspberry Pi `vcgencmd` under-voltage flags). Every probe degrades to `None` — a missing sensor never crashes a node.
+- **Bridges.** `FRIDAY_BRIDGES` names classes implementing `start(bus, ctx)` / `stop()`. A bridge publishes inbound events (an SMS → `message.received`) and subscribes to the `command.*` events it can act on. The Termux dialer, WhatsApp and cloud-voice bridges are this seam; none ship yet.
+- **Graceful lifecycle.** `SIGINT`/`SIGTERM` trigger an ordered shutdown: stop accepting, cancel monitors, stop bridges, drain in-flight handlers, checkpoint and close the store — bounded to 10 s. Every background task is supervised and restarted with backoff.
+
+### Sentinel API
+
+| Route | Auth | Purpose |
+|---|---|---|
+| `GET /health` | none | status, queue depths, platform, supervisor restarts |
+| `GET /telemetry` | none | latest telemetry snapshot (204 if none yet) |
+| `GET /nodes` | none | last heartbeat per node |
+| `POST /events` | bearer | one event or a list (≤100, ≤256 KB) → `202 {"ids":[...]}` |
+| `GET /ws` | bearer (header or `?token=`) | stream events; send `{"subscribe":["node.*"]}` to filter |
+
+An event is a small JSON envelope; `type` is dotted lowercase and `payload` is free-form:
+
+```json
+{"type": "sensor.update", "source": "office-esp32", "payload": {"temp_c": 24.5}, "priority": 0}
+```
+
+Deployment (systemd unit, launchd plist, Tailscale Serve) is documented in [`deploy/README.md`](deploy/README.md).
+
+---
+
 ## 🏗️ System Architecture
 
 ```
@@ -111,7 +147,7 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
                             │ (WebSocket / Audio)     │ (Touch / Video)
                             ▼                         ▼
 ┌───────────────────────────────────────────────────────────────────────────────────────────┐
-│                                FRIDAY ENGINE HUB (friday_hub.py)                          │
+│                          DESKTOP NODE HUB (friday/desktop/hub.py)                         │
 │                                                                                           │
 │  ┌───────────────────────────┐  ┌───────────────────────────┐  ┌────────────────────────┐ │
 │  │    Audio Pipeline         │  │   State & Event Hub       │  │  Gemini Live Session   │ │
@@ -124,13 +160,13 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
        ▼                    ▼                   ▼                        ▼
 ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐
 │ CAPABILITY       │ │ BACKGROUND AGENTS│ │ SPATIAL ENGINE (SVE) │ │ RECOGNITION & MEMORY │
-│ SUBSYSTEMS       │ │ friday_agents.py │ │                      │ │                      │
+│ SUBSYSTEMS       │ │ agents.py        │ │                      │ │                      │
 │                  │ │                  │ │ • sentry_scene.py    │ │ • sentry_recognition │
 │ • sentry_vision  │ │ • os tier        │ │   SceneGraph deltas  │ │   YuNet + SFace 128-d│
-│ • sentry_action  │ │   Gemini 3.1 Pro │ │ • web_gui/sve.js     │ │   Mel MFCC voice     │
+│ • sentry_action  │ │   (routed model) │ │ • web_gui/sve.js     │ │   Mel MFCC voice     │
 │ • sentry_exec    │ │ • spatial tier   │ │   Three.js renderer  │ │ • friday_memory.json │
 │ • sentry_personal│ │ • widget writer  │ │ • web_gui/gestures.js│ │   Persistent facts   │
-│ • sentry_web     │ │   Gemini 3.7 Fl. │ │   MediaPipe hands    │ │                      │
+│ • sentry_web     │ │   (routed model) │ │   MediaPipe hands    │ │                      │
 └──────────────────┘ └──────────────────┘ └──────────────────────┘ └──────────────────────┘
 ```
 
@@ -138,7 +174,7 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
 
 ## 🧩 Core Subsystems
 
-### 1. Gemini Live Hub (`friday_hub.py`)
+### 1. Gemini Live Hub (`friday/desktop/hub.py`)
 - **Bidirectional voice** over WebSockets to `gemini-3.1-flash-live-preview`, typed `LiveConnectConfig` with the **Aoede** prebuilt voice (override with `FRIDAY_VOICE`).
 - **Per-turn receive loop** — `session.receive()` yields one conversational turn and ends, so the loop re-enters it. Without that the session tears down after every reply and the reconnect replays the last turn.
 - **Session lifecycle** — the resumption handle is held **in memory only**, bridging GoAway rotations and drops *within* a run. A new process is always a new conversation.
@@ -146,18 +182,18 @@ The "speaking" state follows the hub's authoritative turn status and the **playb
 - **Frontend assets are never cached stale** — the GUI server sends `Cache-Control: no-cache, must-revalidate`. Without it WKWebView applies heuristic freshness and can keep rendering an old `app.js`/`style.css` across relaunches (the desktop shell runs `private_mode=False`, so its store survives restarts). ETags are kept, so unchanged files still cost only a 304.
 - **Concise by default** — spoken replies stay under ten words; when a widget is mounted, one or two sentences carrying the key takeaway. Detail belongs on screen.
 
-### 2. Background Agent Tiers (`friday_agents.py`)
+### 2. Background Agent Tiers (`friday/desktop/agents.py`)
 Live must stay free for barge-in, so anything multi-step is dispatched off the audio path via `dispatch_agent`. FRIDAY acknowledges in the same turn ("Working on that now.") and announces the result when it lands.
 
-| Tier | Model | Handles |
+| Tier | Model (env var, default) | Handles |
 |---|---|---|
-| `os` | `gemini-3.1-pro-preview` | macOS automation, AppleScript/shell chains, GUI operation |
-| `spatial` | `gemini-3.7-flash` | Building and editing 3D SVE scenes |
-| widget generator | `gemini-3.7-flash` | Writing card HTML (see below) |
+| `os` | `FRIDAY_LLM_AGENT_OS`, `gemini-3.8-flash` | macOS automation, AppleScript/shell chains, GUI operation |
+| `spatial` | `FRIDAY_LLM_AGENT_SPATIAL`, `gemini-3.8-flash` | Building and editing 3D SVE scenes |
+| widget generator | `FRIDAY_LLM_WIDGET`, `gemini-3.7-flash` | Writing card HTML (see below) |
 
 Agents reuse the hub's own tool implementations, run up to 12 tool round-trips, and report back a single spoken sentence. Results are **queued for a gap in the conversation** — a finished agent can never cut FRIDAY off mid-sentence.
 
-### 3. Async Widget Deck (`friday_hub.py`, `widget_generator_agent.py`, `web_gui/app.js`)
+### 3. Async Widget Deck (`hub.py`, `widget_generator.py`, `web_gui/app.js`)
 
 Composing a data-dense card takes seconds. Doing that inside the voice turn would stall the conversation, so the work is split in two:
 
@@ -207,7 +243,7 @@ Measured end to end: the tool returns at **+0.00s**, the skeleton is on screen i
 - **Screen-sized labels** — annotations are sized to a constant on-screen height, depth-tested so geometry occludes them, and decluttered by screen-space overlap (12 visible at once, nearest first).
 - **Markerless hand tracking** — vendored MediaPipe HandLandmarker WASM: point to hover, pinch to grab, pinch empty space to orbit, two-hand pinch to zoom.
 
-### 8. Generated 3D Assets (`services/asset_generator.py`, `web_gui/asset_viewer.js`)
+### 8. Generated 3D Assets (`asset_generator.py`, `web_gui/asset_viewer.js`)
 - **Text-to-3D via Tripo3D** — `generate_spatial_3d_asset` turns a description into a textured `.glb`. Requires `TRIPO_API_KEY`; without it the SVE still works and only this tool is unavailable.
 - **Never on the audio path** — generation takes tens of seconds, so the tool returns instantly, mounts a card, and runs the poll loop as a background task. The card shows live progress and the model drops in when it lands, exactly like the widget generator.
 - **PBR viewer** — `GLTFLoader` with a `RoomEnvironment` image-based light plus cyan key and violet rim lights, orbit controls, and auto-framing (models arrive at arbitrary scale, so each is normalised to unit size and the camera fitted to it).
@@ -222,7 +258,7 @@ Measured end to end: the tool returns at **+0.00s**, the skeleton is on screen i
 - **EventKit calendars** via PyObjC across iCloud, Google, and Exchange.
 - **Apple Mail** via AppleScript — read recent mail, search sender/subject.
 
-### 10. Zero-Trust Remote Access (`setup_remote.sh`, Tailscale)
+### 10. Zero-Trust Remote Access (`deploy/setup_remote.sh`, Tailscale)
 - The hub binds only to `127.0.0.1`; remote access is tunnelled through Tailscale Serve HTTPS.
 - **Human-in-the-loop approvals** — while a remote client is connected, every shell and AppleScript call suspends for one-tap approval with a 45-second auto-deny.
 - **Smart sensor routing** — the phone's mic and camera become the primary senses; the unattended Mac's webcam and screen are left alone unless asked for explicitly.
@@ -263,9 +299,17 @@ Unanticipated markup still lands sensibly: tables, lists, headings, paragraphs a
 
 ---
 
+## 🧪 Tests
+
+```bash
+.venv/bin/pytest
+```
+
+`core` and `sentinel` are covered end to end: SQLite pragmas and crash recovery, the event queue's claim/retry/park lifecycle, every telemetry probe with its sensor missing, API auth and limits, WebSocket filtering, and the daemon's full boot → `SIGTERM` → clean-exit path. `tests/test_boundaries.py` imports every `core`/`sentinel` module in a subprocess where `Quartz`, `pyaudio`, `cv2`, `webview`, `EventKit`, `numpy` and friends are blocked — the guarantee that the sentinel really does run on a headless Linux box. Desktop modules get an import smoke that is skipped where the `desktop` extra is absent.
+
 ## 💻 Tech Stack
 
-- **Core Runtime** — Python 3.10+ (asyncio, websockets, PyAudio, aiohttp, psutil)
+- **Core Runtime** — Python 3.11+ (asyncio, aiohttp, psutil, stdlib sqlite3 in WAL mode); PyAudio and websockets on the desktop node
 - **AI Models** — Google Gemini via `google-genai`: Live `3.1-flash-live-preview`, agents and widget generator `3.1-pro-preview` / `3.7-flash`
 - **macOS Native APIs** — PyObjC (Quartz CoreGraphics, EventKit, Foundation, WebKit), AppleScript
 - **Computer Vision & Biometrics** — OpenCV, ONNX (YuNet, SFace), NumPy, Pillow
@@ -279,7 +323,7 @@ Unanticipated markup still lands sensibly: tables, lists, headings, paragraphs a
 
 ### 1. Prerequisites
 - macOS 12 Monterey or higher (tested on Sonoma / Sequoia)
-- Python 3.10+
+- Python 3.11+
 - A Google Gemini API key
 - *(Optional)* [Tailscale](https://tailscale.com/) for secure remote access
 
@@ -297,8 +341,13 @@ git clone https://github.com/vincecyriac/project_friday.git
 cd project_friday
 
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+.venv/bin/pip install -e ".[desktop,dev]"      # the Mac: desktop node + test tooling
+```
+
+On a headless server or a Raspberry Pi, install only what the sentinel needs — nothing macOS-specific is pulled in:
+
+```bash
+.venv/bin/pip install -e ".[sentinel]"
 ```
 
 ### 4. Configuration
@@ -307,39 +356,53 @@ pip install -r requirements.txt
 cp .env.template .env
 ```
 
+`.env.template` documents every variable. The ones that matter first:
+
 ```ini
 GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-3.1-flash-live-preview   # Live model (or FRIDAY_LLM_LIVE=gemini:<model>)
+FRIDAY_VOICE=Aoede                            # or Kore
+TRIPO_API_KEY=your_tripo_api_key_here         # optional: text-to-3D
 
-# Gemini Live model (voice + realtime)
-GEMINI_MODEL=gemini-3.1-flash-live-preview
+# Per-role model routing, "provider:model". Only gemini ships.
+#FRIDAY_LLM_AGENT_OS=gemini:gemini-3.8-flash
+#FRIDAY_LLM_AGENT_SPATIAL=gemini:gemini-3.8-flash
+#FRIDAY_LLM_WIDGET=gemini:gemini-3.7-flash
 
-# FRIDAY's voice: Aoede (default) or Kore — both feminine.
-# Charon and Puck are masculine and will not match her persona.
-FRIDAY_VOICE=Aoede
-
-# Optional — Tripo3D text-to-3D. Without it only generate_spatial_3d_asset
-# is unavailable; SVE scenes are unaffected. Key: https://platform.tripo3d.ai
-TRIPO_API_KEY=your_tripo_api_key_here
+# Sentinel (server side) and the desktop's link to it
+FRIDAY_SENTINEL_BIND=127.0.0.1:8770
+#FRIDAY_SENTINEL_TOKEN=change-me
+#FRIDAY_SENTINEL_URL=https://server.tailnet.ts.net/sentinel   # set on the Mac
+#FRIDAY_DATA_DIR=/var/lib/friday                              # default: <repo>/data
 ```
+
+Process environment always overrides `.env`, so a systemd `Environment=` line wins.
 
 ### 5. Running FRIDAY
 
 **Desktop app** (PyWebView window, persistent camera/mic permissions):
 
 ```bash
-.venv/bin/python app_desktop.py
+.venv/bin/python -m friday.desktop
 ```
 
 **Headless engine** (serve the GUI to a browser instead):
 
 ```bash
-.venv/bin/python friday_hub.py
+.venv/bin/python -m friday.desktop.hub
 ```
 
 Then open 👉 **`http://127.0.0.1:8766`**
 The WebSocket gateway runs alongside it on `ws://127.0.0.1:8765`.
 
-Ctrl+C, closing the window, or saying "goodbye" all shut down gracefully — audio devices, sockets and servers are released in order.
+**Sentinel** (the 24/7 daemon, on the Mac for development or on the server):
+
+```bash
+.venv/bin/python -m friday.sentinel
+curl -s 127.0.0.1:8770/health
+```
+
+Ctrl+C, closing the window, or saying "goodbye" all shut down gracefully — audio devices, sockets and servers are released in order. The sentinel handles `SIGINT`/`SIGTERM` the same way; see [`deploy/README.md`](deploy/README.md) to run it under `systemd` or `launchd`.
 
 ---
 
@@ -350,7 +413,7 @@ Reachable from iOS or Android over your private Tailscale network, with no publi
 1. Install Tailscale on the Mac and the phone, signed into the same account.
 2. Run the gateway setup:
    ```bash
-   ./setup_remote.sh
+   ./deploy/setup_remote.sh
    ```
 3. Open the printed HTTPS URL on your phone and add it to the Home Screen.
 4. While connected remotely:
@@ -365,40 +428,59 @@ Reset sharing with `tailscale serve reset`.
 ## 📁 Repository Structure
 
 ```
-project_friday/
-├── friday_hub.py              # Async hub: audio, WebSocket, Live session, widget deck
-├── friday_agents.py           # Background agent tiers (os / spatial) and their tool loop
-├── widget_generator_agent.py  # Card HTML synthesis + output sanitiser
-├── app_desktop.py             # PyWebView desktop shell + process lifecycle
-├── sentry_vision.py           # Quartz multi-monitor capture & coordinate tracking
-├── sentry_action.py           # CGEvent mouse/keyboard automation & click mapping
-├── sentry_exec.py             # Shell & osascript execution
-├── sentry_recognition.py      # Face (YuNet+SFace) & voice (MFCC) biometrics
-├── sentry_scene.py            # SVE scene graph manager, validation, persistence
-├── sentry_personal.py         # EventKit calendars & Apple Mail
-├── sentry_web.py              # Async webpage reader
-├── setup_remote.sh            # Tailscale Serve HTTPS configurator
-├── requirements.txt           # Python dependencies
-├── SVE.md                     # Spatial Visualization Engine specification
-├── web_gui/                   # Web interface
-│   ├── index.html             # Orb stage, widget deck, telemetry HUD, sensor dock
-│   ├── style.css              # Glassmorphic spatial layout, widget renderers
-│   ├── app.js                 # WS client, audio pipeline, widget engine, orb state
-│   ├── orb.js                 # Three.js holographic orb (GLSL plasma core + glow)
-│   ├── sve.js                 # Three.js 3D scene graph renderer
-│   ├── gestures.js            # MediaPipe HandLandmarker gesture input
-│   └── vendor/                # Vendored Three.js & MediaPipe WASM models
+friday-ai-assistant/
+├── pyproject.toml                 # one distribution "friday"; extras: desktop, sentinel, dev
+├── .env.template                  # every variable, grouped by shared / gemini / sentinel / desktop
+├── SVE.md                         # Spatial Visualization Engine specification
+├── friday/
+│   ├── core/                      # shared, platform-neutral
+│   │   ├── config.py              # Settings from env + .env; per-role LLM routes
+│   │   ├── platform.py            # OS/arch/Pi/distro probes
+│   │   ├── storage.py             # SQLite/WAL Store + AsyncStore: kv, heartbeats, event queue, telemetry
+│   │   ├── events.py              # Event envelope, Heartbeat, TelemetrySnapshot schemas
+│   │   ├── telemetry.py           # sensor-tolerant collector
+│   │   ├── logsetup.py            # stdout logging, journald-aware
+│   │   └── llm/                   # routing, provider protocol, Gemini adapter
+│   ├── desktop/                   # the macOS node
+│   │   ├── hub.py                 # Async hub: audio, WebSocket, Live session, widget deck
+│   │   ├── app.py                 # PyWebView desktop shell + process lifecycle
+│   │   ├── agents.py              # Background agent tiers (os / spatial) and their tool loop
+│   │   ├── widget_generator.py    # Card HTML synthesis + output sanitiser
+│   │   ├── asset_generator.py     # Tripo3D text-to-3D
+│   │   ├── sentinel_client.py     # heartbeat poster to the sentinel
+│   │   ├── sentry_vision.py       # Quartz multi-monitor capture & coordinate tracking
+│   │   ├── sentry_action.py       # CGEvent mouse/keyboard automation & click mapping
+│   │   ├── sentry_exec.py         # Shell & osascript execution
+│   │   ├── sentry_recognition.py  # Face (YuNet+SFace) & voice (MFCC) biometrics
+│   │   ├── sentry_scene.py        # SVE scene graph manager, validation, persistence
+│   │   ├── sentry_personal.py     # EventKit calendars & Apple Mail
+│   │   ├── sentry_web.py          # Async webpage reader
+│   │   ├── models/                # YuNet + SFace ONNX weights
+│   │   └── web_gui/               # index.html, style.css, app.js, orb.js, sve.js, gestures.js, vendor/
+│   └── sentinel/                  # the headless node
+│       ├── daemon.py              # boot / supervise / ordered shutdown, sd_notify
+│       ├── bus.py                 # durable dispatcher over the store
+│       ├── handlers.py            # Handler protocol + heartbeat / telemetry / log handlers
+│       ├── api.py                 # aiohttp: /health /telemetry /nodes /events /ws
+│       ├── monitors.py            # telemetry sampler, self-heartbeat, housekeeping
+│       └── bridges/               # Bridge protocol + FRIDAY_BRIDGES loader
+├── tests/                         # pytest: core, sentinel, desktop import smoke, boundary guard
+├── deploy/                        # systemd unit, launchd plist, setup_remote.sh, README
+├── docs/superpowers/              # design spec and implementation plan
+└── data/                          # ALL runtime state, git-ignored (FRIDAY_DATA_DIR)
 ```
 
-**Generated at runtime, not in the repo.** These hold personal state and are git-ignored — the app creates them on first run:
+**Generated at runtime, not in the repo.** Everything below lives under `data/` (or `FRIDAY_DATA_DIR`), is git-ignored, and is created on first run:
 
 | File | Holds |
 |---|---|
+| `sentinel.db` (+ `-wal`, `-shm`) | The sentinel's SQLite store: heartbeats, event queue, telemetry |
 | `friday_memory.json` | Persistent facts FRIDAY has been asked to remember |
 | `friday_profiles.json` | Face and voice embeddings for identity recognition |
 | `friday_scenes.json` | Saved 3D scene graphs |
-| `.session_handle.json` | Live session resumption handle |
+| `friday_assets.json`, `generated_assets/` | Generated 3D model index and `.glb` files |
 | `friday_history.jsonl` | Local interaction log |
+| `.webview/` | WKWebView data store (camera/mic permission grants) |
 
 ---
 

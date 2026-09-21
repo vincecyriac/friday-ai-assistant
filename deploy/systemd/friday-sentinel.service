@@ -1,0 +1,30 @@
+# FRIDAY sentinel — systemd unit (Fedora, Raspberry Pi OS, any systemd distro).
+# Replace __USER__ and __REPO__ (see deploy/README.md), then:
+#   sudo cp deploy/systemd/friday-sentinel.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now friday-sentinel
+
+[Unit]
+Description=FRIDAY sentinel (24/7 event bus, telemetry, bridges)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=__USER__
+WorkingDirectory=__REPO__
+EnvironmentFile=-__REPO__/.env
+ExecStart=__REPO__/.venv/bin/python -m friday.sentinel
+Restart=always
+RestartSec=5
+# The daemon pings WATCHDOG=1 every FRIDAY_HEARTBEAT_INTERVAL (30 s default);
+# three missed beats and systemd restarts it.
+WatchdogSec=90
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__REPO__/data
+
+[Install]
+WantedBy=multi-user.target

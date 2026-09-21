@@ -1,23 +1,16 @@
 # Credentials
 .env
 
-# Python caching
+# Python caching / packaging
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
+.pytest_cache/
 
-# Local state and session handles
-.friday_session.json
-.session_handle.json
-friday_history.jsonl
-friday_memory.json
-friday_profiles.json
-friday_scenes.json
-friday_assets.json
-
-# Generated 3D models (binary, regenerable — remove these two lines to commit them)
-generated_assets/
+# Runtime state (FRIDAY_DATA_DIR): SQLite, memory, profiles, scenes, assets, logs
+data/
 
 # Temporary media captures
 *.jpg
