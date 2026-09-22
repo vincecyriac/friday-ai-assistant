@@ -2,40 +2,33 @@
 
 Bound to localhost by default and fronted by Tailscale Serve for remote
 nodes, exactly like the desktop hub. ``POST /events`` is how any node or
-bridge pushes into the bus; ``/ws`` is the push channel out. When
-``FRIDAY_SENTINEL_TOKEN`` is set both require it.
+bridge pushes into the bus; ``/ws`` is the push channel out. Every route
+except ``/health`` requires a principal: a dashboard session cookie or a
+vault-managed node token (see ``principals.py``).
 """
 
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
 import friday
-from friday.core.config import Settings
 from friday.core.events import Event, EventValidationError
-from friday.core.platform import PlatformInfo
-from friday.core.storage import AsyncStore
-from friday.sentinel.bus import EventBus
 from friday.sentinel.handlers import HandlerContext, matches
+from friday.sentinel.principals import require_principal
+from friday.sentinel.services import SERVICES, HealthState, Services   # noqa: F401  (HealthState re-exported)
+from friday.sentinel.web import add_web_routes
 
 log = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 256 * 1024
 MAX_BATCH = 100
-
-
-@dataclass
-class HealthState:
-    started_at: float
-    platform: PlatformInfo
-    restarts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -101,10 +94,6 @@ class WebSocketFanout:
             pass
 
 
-SETTINGS = web.AppKey("settings", Settings)
-BUS = web.AppKey("bus", EventBus)
-STORE = web.AppKey("store", AsyncStore)
-STATE = web.AppKey("state", HealthState)
 FANOUT = web.AppKey("fanout", WebSocketFanout)
 
 
@@ -112,45 +101,35 @@ def _error(status: int, message: str) -> web.Response:
     return web.json_response({"error": message}, status=status)
 
 
-def _authorized(request: web.Request, token: str | None, *, allow_query: bool = False) -> bool:
-    if token is None:
-        return True
-    header = request.headers.get("Authorization", "")
-    supplied = header[7:].strip() if header.startswith("Bearer ") else ""
-    if not supplied and allow_query:
-        supplied = request.query.get("token", "")
-    return bool(supplied) and hmac.compare_digest(supplied.encode(), token.encode())
-
-
 async def health(request: web.Request) -> web.Response:
-    app = request.app
-    state = app[STATE]
+    svc = request.app[SERVICES]
     return web.json_response({
         "status": "ok",
-        "node_id": app[SETTINGS].node_id,
+        "node_id": svc.settings.node_id,
         "version": friday.__version__,
-        "uptime_s": max(0.0, time.time() - state.started_at),
-        "platform": state.platform.to_dict(),
-        "queue": await app[STORE].queue_depths(),
-        "supervisor_restarts": dict(state.restarts),
+        "uptime_s": max(0.0, time.time() - svc.state.started_at),
+        "platform": svc.state.platform.to_dict(),
+        "queue": await svc.store.queue_depths(),
+        "supervisor_restarts": dict(svc.state.restarts),
     })
 
 
 async def telemetry(request: web.Request) -> web.Response:
-    snapshot = await request.app[STORE].telemetry_latest(request.app[SETTINGS].node_id)
+    await require_principal(request)
+    svc = request.app[SERVICES]
+    snapshot = await svc.store.telemetry_latest(svc.settings.node_id)
     return web.Response(status=204) if snapshot is None else web.json_response(snapshot)
 
 
 async def nodes(request: web.Request) -> web.Response:
-    rows = await request.app[STORE].heartbeats()
+    await require_principal(request)
+    rows = await request.app[SERVICES].store.heartbeats()
     return web.json_response([{"node_id": r.node_id, "last_seen": r.last_seen,
                                "status": r.status, "meta": r.meta} for r in rows])
 
 
 async def post_events(request: web.Request) -> web.Response:
-    app = request.app
-    if not _authorized(request, app[SETTINGS].sentinel_token):
-        return _error(401, "missing or invalid bearer token")
+    await require_principal(request)
     try:
         body = await request.read()
     except web.HTTPRequestEntityTooLarge:
@@ -179,17 +158,16 @@ async def post_events(request: web.Request) -> web.Response:
         except EventValidationError as e:
             return _error(400, f"event {index}: {e}")
 
-    ids = [await app[BUS].publish(event) for event in events]
+    bus = request.app[SERVICES].bus
+    ids = [await bus.publish(event) for event in events]
     return web.json_response({"ids": ids}, status=202)
 
 
 async def websocket(request: web.Request) -> web.StreamResponse:
-    app = request.app
-    if not _authorized(request, app[SETTINGS].sentinel_token, allow_query=True):
-        return _error(401, "missing or invalid token")
+    await require_principal(request, allow_query=True)
     ws = web.WebSocketResponse(heartbeat=20.0)
     await ws.prepare(request)
-    fanout = app[FANOUT]
+    fanout = request.app[FANOUT]
     sub = fanout.add(ws)
     try:
         async for msg in ws:
@@ -212,15 +190,11 @@ async def websocket(request: web.Request) -> web.StreamResponse:
     return ws
 
 
-def create_app(settings: Settings, bus: EventBus, store: AsyncStore,
-               state: HealthState) -> web.Application:
+def create_app(services: Services, *, static_dir: Path | None = None) -> web.Application:
     app = web.Application(client_max_size=MAX_BODY_BYTES)
     fanout = WebSocketFanout()
-    bus.subscribe(fanout)
-    app[SETTINGS] = settings
-    app[BUS] = bus
-    app[STORE] = store
-    app[STATE] = state
+    services.bus.subscribe(fanout)
+    app[SERVICES] = services
     app[FANOUT] = fanout
     app.add_routes([
         web.get("/health", health),
@@ -229,14 +203,14 @@ def create_app(settings: Settings, bus: EventBus, store: AsyncStore,
         web.post("/events", post_events),
         web.get("/ws", websocket),
     ])
+    add_web_routes(app, static_dir)
     return app
 
 
 class ApiServer:
-    def __init__(self, settings: Settings, bus: EventBus, store: AsyncStore, state: HealthState):
-        self._settings = settings
-        self._bus = bus
-        self.app = create_app(settings, bus, store, state)
+    def __init__(self, services: Services, *, static_dir: Path | None = None):
+        self._services = services
+        self.app = create_app(services, static_dir=static_dir)
         self._runner: web.AppRunner | None = None
         self.port: int | None = None
 
@@ -247,14 +221,15 @@ class ApiServer:
     async def start(self) -> None:
         runner = web.AppRunner(self.app, access_log=None)
         await runner.setup()
-        site = web.TCPSite(runner, self._settings.sentinel_bind_host, self._settings.sentinel_bind_port)
+        site = web.TCPSite(runner, self._services.settings.sentinel_bind_host,
+                           self._services.settings.sentinel_bind_port)
         await site.start()
         self._runner = runner
         addresses = runner.addresses
-        self.port = addresses[0][1] if addresses else self._settings.sentinel_bind_port
+        self.port = addresses[0][1] if addresses else self._services.settings.sentinel_bind_port
 
     async def stop(self) -> None:
-        self._bus.unsubscribe(self.fanout)
+        self._services.bus.unsubscribe(self.fanout)
         await self.fanout.close_all()
         if self._runner is not None:
             await self._runner.cleanup()

@@ -60,8 +60,9 @@ class Housekeeping:
     async def run(self, ctx: HandlerContext) -> None:
         while True:
             await asyncio.sleep(self.interval_s)          # nothing to prune at boot
-            cutoff = time.time() - ctx.settings.retention_days * 86400
-            counts = await ctx.store.prune(cutoff)
+            now = time.time()
+            counts = await ctx.store.prune(now - ctx.settings.retention_days * 86400)
+            sessions = await ctx.store.sessions_prune(now)
             await ctx.store.checkpoint("PASSIVE")
-            ctx.logger.info("housekeeping: pruned %d telemetry rows, %d events",
-                            counts["telemetry"], counts["events"])
+            ctx.logger.info("housekeeping: pruned %d telemetry rows, %d events, %d sessions",
+                            counts["telemetry"], counts["events"], sessions)

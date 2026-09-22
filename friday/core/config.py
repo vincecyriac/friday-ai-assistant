@@ -9,12 +9,13 @@ from creating ``data_dir``.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import platform as _platform
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from dotenv import dotenv_values
 
@@ -31,6 +32,16 @@ DEFAULT_LLM_ROUTES: Mapping[str, str] = {
 }
 
 SYNC_MODES = ("FULL", "NORMAL")
+
+ENV_PREFIXES = ("FRIDAY_", "GEMINI_", "TRIPO_")
+
+# Registry keys the desktop may receive from the sentinel, mapped onto Settings.
+CONFIG_FIELD_MAP: Mapping[str, str] = {
+    "llm.gemini_api_key": "gemini_api_key",
+    "llm.tripo_api_key": "tripo_api_key",
+    "desktop.voice": "friday_voice",
+}
+ROUTE_KEY_PREFIX = "llm.routes."
 
 
 class ConfigError(ValueError):
@@ -57,6 +68,9 @@ class Settings:
     gemini_model: str | None
     friday_voice: str
     tripo_api_key: str | None
+    master_key: str | None
+    trusted_proxy: bool
+    env: Mapping[str, str]
 
 
 def load_settings(env: Mapping[str, str] | None = None,
@@ -99,13 +113,56 @@ def load_settings(env: Mapping[str, str] | None = None,
         gemini_model=gemini_model,
         friday_voice=merged.get("FRIDAY_VOICE") or "Aoede",
         tripo_api_key=_optional(merged, "TRIPO_API_KEY"),
+        master_key=_optional(merged, "FRIDAY_MASTER_KEY"),
+        trusted_proxy=_bool(merged, "FRIDAY_TRUSTED_PROXY", False),
+        env={k: v for k, v in merged.items() if k.startswith(ENV_PREFIXES)},
     )
 
 
+_override: Settings | None = None
+
+
 @lru_cache(maxsize=1)
+def _load_cached() -> Settings:
+    return load_settings()
+
+
 def get_settings() -> Settings:
     """Process-wide Settings for modules that cannot be handed one explicitly."""
-    return load_settings()
+    return _override if _override is not None else _load_cached()
+
+
+def override_settings(settings: Settings) -> None:
+    """Make ``get_settings()`` return ``settings`` for the rest of the process
+    (the desktop calls this after pulling configuration from the sentinel)."""
+    global _override
+    _override = settings
+
+
+def _clear_settings_cache() -> None:
+    global _override
+    _override = None
+    _load_cached.cache_clear()
+
+
+get_settings.cache_clear = _clear_settings_cache      # type: ignore[attr-defined]
+
+
+def apply_overrides(settings: Settings, values: Mapping[str, Any]) -> Settings:
+    """Overlay registry-keyed values (from GET /config) onto Settings. Unknown
+    keys and None values are ignored; the input is not mutated."""
+    routes = dict(settings.llm_routes)
+    changes: dict[str, Any] = {}
+    for key, value in values.items():
+        if value is None:
+            continue
+        if key.startswith(ROUTE_KEY_PREFIX):
+            role = key[len(ROUTE_KEY_PREFIX):]
+            if role in LLM_ROLES:
+                routes[role] = str(value)
+        elif key in CONFIG_FIELD_MAP:
+            changes[CONFIG_FIELD_MAP[key]] = value
+    return dataclasses.replace(settings, llm_routes=routes, **changes)
 
 
 # ---------------------------------------------------------------- helpers
@@ -163,6 +220,18 @@ def _int(env: Mapping[str, str], key: str, default: int) -> int:
         return int(raw)
     except ValueError as e:
         raise ConfigError(f"{key} must be an integer, got {raw!r}") from e
+
+
+def _bool(env: Mapping[str, str], key: str, default: bool) -> bool:
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{key} must be true or false, got {raw!r}")
 
 
 def _csv(value: str) -> tuple[str, ...]:

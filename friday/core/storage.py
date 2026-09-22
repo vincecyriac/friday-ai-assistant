@@ -55,6 +55,25 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "  ts REAL NOT NULL, node_id TEXT NOT NULL, snapshot TEXT NOT NULL)",
         "CREATE INDEX telemetry_node_ts ON telemetry(node_id, ts DESC)",
     ),
+    2: (
+        "CREATE TABLE settings ("
+        "  key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0,"
+        "  updated_at REAL NOT NULL, updated_by TEXT NOT NULL)",
+        "CREATE TABLE users ("
+        "  username TEXT PRIMARY KEY, password_hash TEXT NOT NULL,"
+        "  created_at REAL NOT NULL, password_changed_at REAL NOT NULL)",
+        "CREATE TABLE sessions ("
+        "  id TEXT PRIMARY KEY, username TEXT NOT NULL, created_at REAL NOT NULL,"
+        "  expires_at REAL NOT NULL, last_seen REAL NOT NULL, user_agent TEXT, ip TEXT)",
+        "CREATE INDEX sessions_expires ON sessions(expires_at)",
+        "CREATE TABLE node_tokens ("
+        "  id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE,"
+        "  created_at REAL NOT NULL, last_used REAL, revoked_at REAL)",
+        "CREATE TABLE audit ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, actor TEXT NOT NULL,"
+        "  action TEXT NOT NULL, target TEXT, detail TEXT NOT NULL)",
+        "CREATE INDEX audit_ts ON audit(ts DESC)",
+    ),
 }
 
 _EVENT_COLUMNS = "id, ts, source, type, payload, priority, status, attempts, error, claimed_at, processed_at"
@@ -76,6 +95,53 @@ class StoredEvent:
     error: str | None
     claimed_at: float | None
     processed_at: float | None
+
+
+@dataclass(frozen=True)
+class SettingRow:
+    key: str
+    value: str
+    secret: bool
+    updated_at: float
+    updated_by: str
+
+
+@dataclass(frozen=True)
+class UserRow:
+    username: str
+    password_hash: str
+    created_at: float
+    password_changed_at: float
+
+
+@dataclass(frozen=True)
+class SessionRow:
+    id: str
+    username: str
+    created_at: float
+    expires_at: float
+    last_seen: float
+    user_agent: str | None
+    ip: str | None
+
+
+@dataclass(frozen=True)
+class NodeTokenRow:
+    id: str
+    name: str
+    created_at: float
+    last_used: float | None
+    revoked_at: float | None
+
+
+@dataclass(frozen=True)
+class AuditRow:
+    id: int
+    ts: float
+    actor: str
+    action: str
+    target: str | None
+    detail: dict[str, Any]
 
 
 def _row_to_stored(row: sqlite3.Row) -> StoredEvent:
@@ -327,6 +393,125 @@ class Store:
             (older_than_ts,)).rowcount
         return {"telemetry": telemetry, "events": events}
 
+    # -------------------------------------------------------------- settings
+
+    def setting_get(self, key: str) -> SettingRow | None:
+        row = self._conn.execute(
+            "SELECT key, value, secret, updated_at, updated_by FROM settings WHERE key = ?",
+            (key,)).fetchone()
+        return None if row is None else SettingRow(
+            row["key"], row["value"], bool(row["secret"]), row["updated_at"], row["updated_by"])
+
+    def setting_set(self, key: str, value: str, *, secret: bool, updated_by: str, ts: float) -> None:
+        self._conn.execute(
+            "INSERT INTO settings (key, value, secret, updated_at, updated_by) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, secret = excluded.secret, "
+            "updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+            (key, value, int(secret), ts, updated_by))
+
+    def setting_delete(self, key: str) -> bool:
+        return self._conn.execute("DELETE FROM settings WHERE key = ?", (key,)).rowcount > 0
+
+    def settings_all(self) -> list[SettingRow]:
+        rows = self._conn.execute(
+            "SELECT key, value, secret, updated_at, updated_by FROM settings ORDER BY key").fetchall()
+        return [SettingRow(r["key"], r["value"], bool(r["secret"]), r["updated_at"], r["updated_by"])
+                for r in rows]
+
+    # ----------------------------------------------------------------- users
+
+    def user_get(self, username: str) -> UserRow | None:
+        row = self._conn.execute(
+            "SELECT username, password_hash, created_at, password_changed_at FROM users WHERE username = ?",
+            (username,)).fetchone()
+        return None if row is None else UserRow(
+            row["username"], row["password_hash"], row["created_at"], row["password_changed_at"])
+
+    def user_upsert(self, username: str, password_hash: str, ts: float) -> None:
+        self._conn.execute(
+            "INSERT INTO users (username, password_hash, created_at, password_changed_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(username) DO UPDATE SET "
+            "password_hash = excluded.password_hash, password_changed_at = excluded.password_changed_at",
+            (username, password_hash, ts, ts))
+
+    def users_count(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+
+    # -------------------------------------------------------------- sessions
+
+    def session_create(self, id: str, username: str, ts: float, expires_at: float,
+                       user_agent: str | None, ip: str | None) -> None:
+        self._conn.execute(
+            "INSERT INTO sessions (id, username, created_at, expires_at, last_seen, user_agent, ip) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (id, username, ts, expires_at, ts, user_agent, ip))
+
+    def session_get(self, id: str) -> SessionRow | None:
+        row = self._conn.execute(
+            "SELECT id, username, created_at, expires_at, last_seen, user_agent, ip "
+            "FROM sessions WHERE id = ?", (id,)).fetchone()
+        return None if row is None else SessionRow(
+            row["id"], row["username"], row["created_at"], row["expires_at"],
+            row["last_seen"], row["user_agent"], row["ip"])
+
+    def session_touch(self, id: str, ts: float) -> None:
+        self._conn.execute("UPDATE sessions SET last_seen = ? WHERE id = ?", (ts, id))
+
+    def session_delete(self, id: str) -> bool:
+        return self._conn.execute("DELETE FROM sessions WHERE id = ?", (id,)).rowcount > 0
+
+    def sessions_prune(self, now: float) -> int:
+        return self._conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,)).rowcount
+
+    # ----------------------------------------------------------- node tokens
+
+    def node_token_create(self, id: str, name: str, token_hash: str, ts: float) -> None:
+        self._conn.execute(
+            "INSERT INTO node_tokens (id, name, token_hash, created_at) VALUES (?, ?, ?, ?)",
+            (id, name, token_hash, ts))
+
+    def node_token_by_hash(self, token_hash: str) -> NodeTokenRow | None:
+        row = self._conn.execute(
+            "SELECT id, name, created_at, last_used, revoked_at FROM node_tokens "
+            "WHERE token_hash = ? AND revoked_at IS NULL", (token_hash,)).fetchone()
+        return None if row is None else NodeTokenRow(
+            row["id"], row["name"], row["created_at"], row["last_used"], row["revoked_at"])
+
+    def node_token_touch(self, id: str, ts: float) -> None:
+        self._conn.execute("UPDATE node_tokens SET last_used = ? WHERE id = ?", (ts, id))
+
+    def node_tokens_list(self) -> list[NodeTokenRow]:
+        rows = self._conn.execute(
+            "SELECT id, name, created_at, last_used, revoked_at FROM node_tokens ORDER BY created_at").fetchall()
+        return [NodeTokenRow(r["id"], r["name"], r["created_at"], r["last_used"], r["revoked_at"])
+                for r in rows]
+
+    def node_token_revoke(self, id: str, ts: float) -> bool:
+        return self._conn.execute(
+            "UPDATE node_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+            (ts, id)).rowcount > 0
+
+    # ----------------------------------------------------------------- audit
+
+    def audit_append(self, ts: float, actor: str, action: str, target: str | None,
+                     detail: dict[str, Any]) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO audit (ts, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)",
+            (ts, actor, action, target, json.dumps(detail)))
+        return int(cur.lastrowid)
+
+    def audit_list(self, limit: int = 100, before_id: int | None = None) -> list[AuditRow]:
+        if before_id is None:
+            rows = self._conn.execute(
+                "SELECT id, ts, actor, action, target, detail FROM audit ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id, ts, actor, action, target, detail FROM audit WHERE id < ? "
+                "ORDER BY id DESC LIMIT ?", (before_id, limit)).fetchall()
+        return [AuditRow(r["id"], r["ts"], r["actor"], r["action"], r["target"], json.loads(r["detail"]))
+                for r in rows]
+
 
 class AsyncStore:
     """A ``Store`` driven from asyncio.
@@ -423,3 +608,62 @@ class AsyncStore:
 
     async def prune(self, older_than_ts: float) -> dict[str, int]:
         return await self.run(self._store.prune, older_than_ts)
+
+    async def setting_get(self, key: str) -> SettingRow | None:
+        return await self.run(self._store.setting_get, key)
+
+    async def setting_set(self, key: str, value: str, *, secret: bool, updated_by: str, ts: float) -> None:
+        await self.run(self._store.setting_set, key, value, secret=secret, updated_by=updated_by, ts=ts)
+
+    async def setting_delete(self, key: str) -> bool:
+        return await self.run(self._store.setting_delete, key)
+
+    async def settings_all(self) -> list[SettingRow]:
+        return await self.run(self._store.settings_all)
+
+    async def user_get(self, username: str) -> UserRow | None:
+        return await self.run(self._store.user_get, username)
+
+    async def user_upsert(self, username: str, password_hash: str, ts: float) -> None:
+        await self.run(self._store.user_upsert, username, password_hash, ts)
+
+    async def users_count(self) -> int:
+        return await self.run(self._store.users_count)
+
+    async def session_create(self, id: str, username: str, ts: float, expires_at: float,
+                             user_agent: str | None, ip: str | None) -> None:
+        await self.run(self._store.session_create, id, username, ts, expires_at, user_agent, ip)
+
+    async def session_get(self, id: str) -> SessionRow | None:
+        return await self.run(self._store.session_get, id)
+
+    async def session_touch(self, id: str, ts: float) -> None:
+        await self.run(self._store.session_touch, id, ts)
+
+    async def session_delete(self, id: str) -> bool:
+        return await self.run(self._store.session_delete, id)
+
+    async def sessions_prune(self, now: float) -> int:
+        return await self.run(self._store.sessions_prune, now)
+
+    async def node_token_create(self, id: str, name: str, token_hash: str, ts: float) -> None:
+        await self.run(self._store.node_token_create, id, name, token_hash, ts)
+
+    async def node_token_by_hash(self, token_hash: str) -> NodeTokenRow | None:
+        return await self.run(self._store.node_token_by_hash, token_hash)
+
+    async def node_token_touch(self, id: str, ts: float) -> None:
+        await self.run(self._store.node_token_touch, id, ts)
+
+    async def node_tokens_list(self) -> list[NodeTokenRow]:
+        return await self.run(self._store.node_tokens_list)
+
+    async def node_token_revoke(self, id: str, ts: float) -> bool:
+        return await self.run(self._store.node_token_revoke, id, ts)
+
+    async def audit_append(self, ts: float, actor: str, action: str, target: str | None,
+                           detail: dict[str, Any]) -> int:
+        return await self.run(self._store.audit_append, ts, actor, action, target, detail)
+
+    async def audit_list(self, limit: int = 100, before_id: int | None = None) -> list[AuditRow]:
+        return await self.run(self._store.audit_list, limit, before_id)

@@ -11,7 +11,7 @@ MODULES = [
     "friday.desktop.sentry_vision", "friday.desktop.sentry_action", "friday.desktop.sentry_recognition",
     "friday.desktop.sentry_personal", "friday.desktop.asset_generator", "friday.desktop.agents",
     "friday.desktop.widget_generator", "friday.desktop.hub", "friday.desktop.app",
-    "friday.desktop.sentinel_client",
+    "friday.desktop.sentinel_client", "friday.desktop.config_pull",
 ]
 
 
@@ -52,6 +52,7 @@ def test_hub_models_come_from_routing():
     from friday.desktop import agents, hub, widget_generator
 
     assert hub.MODEL_ID == resolve(hub.settings, "live").model
-    assert agents.OS_AGENT_MODEL == resolve(hub.settings, "agent_os").model
-    assert agents.TIERS["os"]["model"] == agents.OS_AGENT_MODEL
-    assert widget_generator.WIDGET_MODEL == resolve(hub.settings, "widget").model
+    assert agents.TIERS["os"]["role"] == "agent_os" and agents.TIERS["spatial"]["role"] == "agent_spatial"
+    assert agents.model_for("os") == resolve(hub.settings, "agent_os").model
+    assert widget_generator.widget_model() == resolve(hub.settings, "widget").model
+    assert str(hub.CONFIG_CACHE_FILE).startswith(str(hub.settings.data_dir))

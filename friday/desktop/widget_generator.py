@@ -18,7 +18,8 @@ from google.genai import types
 from friday.core.config import get_settings
 from friday.core.llm import resolve
 
-WIDGET_MODEL = resolve(get_settings(), "widget").model      # FRIDAY_LLM_WIDGET
+def widget_model() -> str:
+    return resolve(get_settings(), "widget").model          # FRIDAY_LLM_WIDGET; per call so a config pull applies
 GENERATION_TIMEOUT_S = 45.0
 MAX_HTML_CHARS = 24000
 
@@ -194,7 +195,7 @@ async def generate_widget_html(client, title: str, query_context: str,
 
     response = await asyncio.wait_for(
         client.aio.models.generate_content(
-            model=WIDGET_MODEL, contents=prompt, config=config),
+            model=widget_model(), contents=prompt, config=config),
         timeout=GENERATION_TIMEOUT_S,
     )
     html = sanitize_widget_html(_strip_fences(response.text))

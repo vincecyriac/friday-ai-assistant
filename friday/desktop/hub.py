@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 import sys
 import re
@@ -26,10 +27,11 @@ try:
 except ImportError:          # telemetry degrades to clock-only in the GUI
     psutil = None
 import friday
-from friday.core.config import get_settings
+from friday.core.config import get_settings, override_settings
 from friday.core.events import Event, Heartbeat
 from friday.core.llm import gemini_client, resolve
 from friday.core.platform import detect
+from friday.desktop import config_pull
 from friday.desktop.sentinel_client import SentinelClient
 from google.genai import types
 
@@ -50,6 +52,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))       # this package: web_
 DATA_DIR = str(settings.data_dir)                            # all runtime state
 HISTORY_LOG_FILE = os.path.join(DATA_DIR, "friday_history.jsonl")
 MEMORY_FILE = os.path.join(DATA_DIR, "friday_memory.json")
+CONFIG_CACHE_FILE = os.path.join(DATA_DIR, "config-cache.json")
 
 # Model selection is routed per role from the environment (FRIDAY_LLM_LIVE,
 # or the legacy GEMINI_MODEL alias); see friday.core.llm.
@@ -2346,6 +2349,21 @@ async def run_friday():
             main_loop.add_signal_handler(_sig, request_shutdown, _sig.name)
         except (NotImplementedError, RuntimeError, ValueError, AttributeError):
             pass
+
+    # The sentinel is the configuration authority: overlay its view onto the
+    # local .env (falling back to the last cached pull, then .env alone).
+    global settings, MODEL_ID, LIVE_VOICE
+    if settings.sentinel_url:
+        puller = SentinelClient(settings.sentinel_url, settings.sentinel_token, settings.node_id)
+        try:
+            settings, source = await config_pull.pull_or_cached(
+                settings, puller.fetch_config, Path(CONFIG_CACHE_FILE))
+        finally:
+            await puller.aclose()
+        override_settings(settings)
+        log_info(f"Configuration source: {source}")
+    MODEL_ID = resolve(settings, "live").model
+    LIVE_VOICE = settings.friday_voice
 
     if not settings.gemini_api_key:
         set_system_status("ERROR")

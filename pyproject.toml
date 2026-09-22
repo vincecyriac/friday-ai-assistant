@@ -12,6 +12,7 @@ dependencies = [
   "psutil",
   "aiohttp",
   "google-genai",
+  "cryptography",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +51,7 @@ version = {attr = "friday.__version__"}
 
 [tool.setuptools.package-data]
 "friday.desktop" = ["web_gui/**/*", "models/*"]
+"friday.sentinel" = ["dashboard/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

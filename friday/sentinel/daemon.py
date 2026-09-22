@@ -19,13 +19,17 @@ from friday.core.events import Event
 from friday.core.logsetup import configure_logging
 from friday.core.platform import detect
 from friday.core.storage import AsyncStore
-from friday.sentinel.api import ApiServer, HealthState
+from friday.core.vault import Vault
+from friday.sentinel.api import ApiServer
+from friday.sentinel.auth import LoginLimiter, NodeTokens, SessionManager
 from friday.sentinel.bridges import Bridge, load_bridges
 from friday.sentinel.bus import EventBus
 from friday.sentinel.handlers import (HandlerContext, HeartbeatHandler, LogHandler,
                                       TelemetryHandler)
 from friday.sentinel.monitors import Housekeeping, SelfHeartbeat, TelemetryMonitor
+from friday.sentinel.runtime_config import RuntimeConfig
 from friday.sentinel.sdnotify import sd_notify
+from friday.sentinel.services import HealthState, Services
 
 
 class Sentinel:
@@ -38,6 +42,7 @@ class Sentinel:
         self.settings = settings
         self.ready = asyncio.Event()
         self.api_port: int | None = None
+        self.services: Services | None = None
         self.state = HealthState(started_at=time.time(), platform=detect())
         self._shutdown = asyncio.Event()
         self._reason = ""
@@ -86,11 +91,24 @@ class Sentinel:
             if requeued:
                 log.warning("requeued %d event(s) orphaned by a previous run", requeued)
 
+            vault = Vault.from_master_key(s.master_key or "")
+            log.info("vault open (key fingerprint %s)", vault.fingerprint())
+
             bus = EventBus(store)
             ctx = HandlerContext(settings=s, store=store, bus=bus,
                                  logger=logging.getLogger("friday.sentinel.events"))
             for handler in (HeartbeatHandler(), TelemetryHandler(), LogHandler()):
                 bus.subscribe(handler)
+
+            config = RuntimeConfig(store, vault, s, bus)
+            await config.load()
+            services = Services(settings=s, store=store, bus=bus, state=self.state, vault=vault,
+                                config=config, sessions=SessionManager(store),
+                                node_tokens=NodeTokens(store), limiter=LoginLimiter())
+            self.services = services
+            if await store.users_count() == 0:
+                log.warning("no dashboard user exists; create one with: "
+                            "friday-sentinel user set-password <name>")
 
             for bridge in load_bridges(s):
                 try:
@@ -101,7 +119,7 @@ class Sentinel:
                     log.exception("bridge %s failed to start; skipping it",
                                   getattr(bridge, "name", bridge))
 
-            server = ApiServer(s, bus, store, self.state)
+            server = ApiServer(services)
             await server.start()
             self.api_port = server.port
             log.info("API listening on http://%s:%s", s.sentinel_bind_host, server.port)

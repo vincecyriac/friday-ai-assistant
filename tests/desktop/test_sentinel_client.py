@@ -62,3 +62,35 @@ async def test_unreachable_is_false_and_warns_once(caplog):
     levels = [r.levelno for r in caplog.records if "sentinel" in r.getMessage()]
     assert levels[0] == logging.WARNING
     assert all(level == logging.DEBUG for level in levels[1:])
+
+
+async def test_fetch_config_success(aiohttp_server):
+    async def config(request):
+        assert request.headers["Authorization"] == "Bearer tok" and request.query["scope"] == "desktop"
+        return web.json_response({"scope": "desktop", "values": {"llm.gemini_api_key": "k"}, "generated_at": 1.0})
+    app = web.Application()
+    app.add_routes([web.get("/sentinel/config", config)])
+    server = await aiohttp_server(app)
+    client = SentinelClient(f"http://127.0.0.1:{server.port}/sentinel", "tok", "mac")
+    try:
+        assert await client.fetch_config() == {"llm.gemini_api_key": "k"}
+    finally:
+        await client.aclose()
+
+
+async def test_fetch_config_failures_return_none(aiohttp_server):
+    async def denied(request):
+        return web.json_response({"error": "x"}, status=401)
+    app = web.Application()
+    app.add_routes([web.get("/sentinel/config", denied)])
+    server = await aiohttp_server(app)
+    client = SentinelClient(f"http://127.0.0.1:{server.port}/sentinel", "tok", "mac")
+    try:
+        assert await client.fetch_config() is None
+    finally:
+        await client.aclose()
+    dead = SentinelClient("http://127.0.0.1:9/sentinel", "tok", "mac", timeout_s=0.5)
+    try:
+        assert await dead.fetch_config() is None
+    finally:
+        await dead.aclose()

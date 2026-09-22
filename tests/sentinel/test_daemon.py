@@ -12,6 +12,7 @@ from friday.core.config import ConfigError, load_settings
 from friday.core.events import Event
 from friday.core.storage import Store
 from friday.sentinel.daemon import Sentinel
+from tests.conftest import TEST_MASTER_KEY
 from tests.sentinel.test_bridges import FakeBridge
 
 
@@ -23,6 +24,7 @@ def _settings(tmp_path, **extra):
         "FRIDAY_TELEMETRY_INTERVAL": "0.05",
         "FRIDAY_HEARTBEAT_INTERVAL": "0.05",
         "FRIDAY_LOG_LEVEL": "DEBUG",
+        "FRIDAY_MASTER_KEY": TEST_MASTER_KEY,
         **extra,
     }
     return load_settings(env=env, env_file=tmp_path / "absent.env")
@@ -133,5 +135,45 @@ def test_main_reports_config_error(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("FRIDAY_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("FRIDAY_SENTINEL_BIND", "127.0.0.1:0")
     monkeypatch.setenv("FRIDAY_BRIDGES", "no.such.Bridge")
-    assert main() == 1
+    monkeypatch.setenv("FRIDAY_MASTER_KEY", TEST_MASTER_KEY)
+    assert main([]) == 1
     assert "FRIDAY_BRIDGES" in capsys.readouterr().err
+
+
+async def test_boot_without_master_key_raises_config_error(tmp_path):
+    settings = _settings(tmp_path, FRIDAY_MASTER_KEY="")
+    with pytest.raises(ConfigError) as excinfo:
+        await Sentinel(settings).run()
+    assert "FRIDAY_MASTER_KEY" in str(excinfo.value)
+
+
+async def test_services_are_wired_and_no_user_warning_logged(tmp_path, caplog):
+    sentinel = Sentinel(_settings(tmp_path))
+    with caplog.at_level(logging.WARNING, logger="friday.sentinel"):
+        task = await _start(sentinel)
+        assert sentinel.services is not None
+        assert sentinel.services.config.get("controls.call_mode") == "urgent_only"
+        assert sentinel.services.vault.fingerprint()
+        sentinel.request_shutdown("done")
+        assert await asyncio.wait_for(task, 10) == 0
+    assert any("friday-sentinel user set-password" in r.getMessage() for r in caplog.records)
+
+
+async def test_node_token_from_cli_store_works_against_running_daemon(tmp_path):
+    settings = _settings(tmp_path)
+    from friday.sentinel.auth import NODE_TOKEN_PREFIX, new_token, token_hash
+    seed = Store.open(settings.data_dir / "sentinel.db")
+    token = new_token(NODE_TOKEN_PREFIX)
+    seed.node_token_create("cli1", "desktop", token_hash(token), time.time())
+    seed.close()
+
+    sentinel = Sentinel(settings)
+    task = await _start(sentinel)
+    async with aiohttp.ClientSession() as http:
+        async with http.get(f"http://127.0.0.1:{sentinel.api_port}/nodes") as resp:
+            assert resp.status == 401
+        async with http.get(f"http://127.0.0.1:{sentinel.api_port}/nodes",
+                            headers={"Authorization": f"Bearer {token}"}) as resp:
+            assert resp.status == 200
+    sentinel.request_shutdown("done")
+    assert await asyncio.wait_for(task, 10) == 0

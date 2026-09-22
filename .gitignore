@@ -20,3 +20,10 @@ data/
 
 # Virtual Environment
 .venv/
+
+# macOS Finder metadata
+.DS_Store
+
+# Build output
+build/
+dist/

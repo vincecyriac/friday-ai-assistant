@@ -26,8 +26,6 @@ from friday.core.config import get_settings
 from friday.core.llm import resolve
 
 # Routed per role from the environment (FRIDAY_LLM_AGENT_OS / _AGENT_SPATIAL).
-OS_AGENT_MODEL = resolve(get_settings(), "agent_os").model
-SVE_AGENT_MODEL = resolve(get_settings(), "agent_spatial").model
 
 MAX_STEPS = 12          # tool round-trips before the agent must conclude
 STEP_TIMEOUT_S = 120.0  # per model call
@@ -44,7 +42,7 @@ _SHARED_RULES = (
 
 TIERS = {
     "os": {
-        "model": OS_AGENT_MODEL,
+        "role": "agent_os",
         "label": "OS automation",
         "system": _SHARED_RULES + (
             " You specialise in macOS control: shell commands, AppleScript, window and app "
@@ -54,7 +52,7 @@ TIERS = {
         ),
     },
     "spatial": {
-        "model": SVE_AGENT_MODEL,
+        "role": "agent_spatial",
         "label": "spatial visualisation",
         "system": _SHARED_RULES + (
             " You specialise in the Spatial Visualization Engine: building and editing live 3D "
@@ -86,6 +84,11 @@ def resolve_tier(name: str) -> str:
     return name if name in TIERS else DEFAULT_TIER
 
 
+def model_for(tier: str) -> str:
+    """The routed model for a tier, resolved per call so a config pull applies."""
+    return resolve(get_settings(), TIERS[resolve_tier(tier)]["role"]).model
+
+
 async def run_agent(client, tier, goal, tool_decls, execute_tool,
                     context="", on_step=None):
     """Drive one goal to completion on the given tier.
@@ -109,7 +112,7 @@ async def run_agent(client, tier, goal, tool_decls, execute_tool,
     for _ in range(MAX_STEPS):
         response = await asyncio.wait_for(
             client.aio.models.generate_content(
-                model=spec["model"], contents=contents, config=config
+                model=model_for(tier), contents=contents, config=config
             ),
             timeout=STEP_TIMEOUT_S,
         )

@@ -4,16 +4,24 @@ The sentinel is `python -m friday.sentinel`. It reads `.env` from the repo
 root, keeps all state under `data/` (or `FRIDAY_DATA_DIR`), and listens on
 `FRIDAY_SENTINEL_BIND` (default `127.0.0.1:8770`).
 
-## Any node: install
+## Sentinel: first boot
 
 ```bash
 git clone <repo> && cd friday-ai-assistant
 python3 -m venv .venv
-.venv/bin/pip install -e ".[sentinel]"        # headless server / Pi
-cp .env.template .env                          # set FRIDAY_SENTINEL_TOKEN at least
-.venv/bin/python -m friday.sentinel            # foreground smoke run
-curl -s 127.0.0.1:8770/health
+.venv/bin/pip install -e ".[sentinel]"
+cp .env.template .env
+.venv/bin/python -m friday.sentinel keygen >> .env        # once only: sets FRIDAY_MASTER_KEY — back it up
+.venv/bin/python -m friday.sentinel user set-password vince
+.venv/bin/python -m friday.sentinel token create desktop   # paste into the Mac's .env as FRIDAY_SENTINEL_TOKEN
+.venv/bin/python -m friday.sentinel                        # foreground smoke run
 ```
+
+Open `http://127.0.0.1:8770/` (or the Tailscale URL), sign in, and enter the
+Gemini key under **Settings → llm**. The desktop pulls it on its next boot.
+
+Behind Caddy/Nginx/Tailscale Serve set `FRIDAY_TRUSTED_PROXY=true` so the
+session cookie is marked `Secure` from the forwarded scheme.
 
 ## Linux (Fedora, Raspberry Pi OS): systemd
 
@@ -50,7 +58,7 @@ Then point the desktop at it in its `.env`:
 
 ```ini
 FRIDAY_SENTINEL_URL=https://<host>.<tailnet>.ts.net/sentinel
-FRIDAY_SENTINEL_TOKEN=<same token as the sentinel>
+FRIDAY_SENTINEL_TOKEN=<token from "friday-sentinel token create desktop">
 ```
 
 `setup_remote.sh` in this directory is the existing script for exposing the
@@ -61,7 +69,15 @@ FRIDAY_SENTINEL_TOKEN=<same token as the sentinel>
 | Route | Auth | Purpose |
 |---|---|---|
 | `GET /health` | none | status, queue depths, platform, supervisor restarts |
-| `GET /telemetry` | none | latest telemetry snapshot (204 if none yet) |
-| `GET /nodes` | none | last heartbeat per node |
-| `POST /events` | bearer | one event or a list (≤100, ≤256 KB): `{"type":"a.b","source":"node","payload":{}}` → `202 {"ids":[...]}` |
-| `GET /ws` | bearer (header or `?token=`) | stream events; send `{"subscribe":["node.*"]}` to filter |
+| `GET /telemetry` | node token or session | latest telemetry snapshot (204 if none yet) |
+| `GET /nodes` | node token or session | last heartbeat per node |
+| `POST /events` | node token or session | one event or a list (≤100, ≤256 KB): `{"type":"a.b","source":"node","payload":{}}` → `202 {"ids":[...]}` |
+| `GET /ws` | node token or session (header, cookie or `?token=`) | stream events; send `{"subscribe":["node.*"]}` to filter |
+| `POST /auth/login` · `POST /auth/logout` · `GET /auth/me` | session | dashboard sign-in (cookie: HttpOnly, SameSite=Lax, Secure over HTTPS) |
+| `GET/PUT /api/settings`, `GET /api/settings/schema` | session | vault-backed settings; secrets masked |
+| `GET/POST /api/tokens`, `DELETE /api/tokens/{id}` | session | node tokens (plaintext shown once) |
+| `GET /api/audit` | session | who changed what |
+| `GET /config?scope=desktop` | node token or session | decrypted config for a node scope; audited |
+
+Node tokens go in `Authorization: Bearer fn_…`. State-changing dashboard
+calls (`POST`/`PUT`/`DELETE`) must also send `X-FRIDAY-Client: dashboard`.

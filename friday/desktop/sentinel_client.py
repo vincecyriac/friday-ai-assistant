@@ -44,6 +44,24 @@ class SentinelClient:
             self._failing = False
         return True
 
+    async def fetch_config(self, scope: str = "desktop") -> dict | None:
+        """Pull this node's configuration. None on any failure (never raises)."""
+        headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
+        url = self._events_url[: -len("/events")] + "/config"
+        try:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession(timeout=self._timeout)
+            async with self._session.get(url, params={"scope": scope}, headers=headers) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                body = await resp.json()
+        except Exception as e:
+            (log.debug if self._failing else log.warning)("sentinel config pull from %s failed: %s", url, e)
+            self._failing = True
+            return None
+        values = body.get("values") if isinstance(body, dict) else None
+        return values if isinstance(values, dict) else None
+
     async def aclose(self) -> None:
         if self._session is not None and not self._session.closed:
             await self._session.close()

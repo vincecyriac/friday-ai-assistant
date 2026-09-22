@@ -42,7 +42,7 @@ def test_open_rejects_unknown_sync(tmp_path):
 def test_open_creates_parent_and_schema(tmp_path):
     s = Store.open(tmp_path / "deep" / "er" / "t.db")
     try:
-        assert s.schema_version() == 1
+        assert s.schema_version() == 2
         names = {r[0] for r in s.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"schema_version", "kv", "heartbeats", "events", "telemetry"} <= names
     finally:
@@ -54,7 +54,7 @@ def test_reopen_is_idempotent(tmp_path):
     Store.open(p).close()
     s = Store.open(p)
     try:
-        assert s.schema_version() == 1
+        assert s.schema_version() == 2
     finally:
         s.close()
 
@@ -183,7 +183,7 @@ def test_corrupt_file_is_quarantined(tmp_path):
     p.write_bytes(b"this is not a database " * 100)
     s = Store.open(p)
     try:
-        assert s.schema_version() == 1
+        assert s.schema_version() == 2
         s.kv_set("k", 1)
         assert s.kv_get("k") == 1
     finally:
