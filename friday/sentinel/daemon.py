@@ -124,9 +124,9 @@ class Sentinel:
             self.api_port = server.port
             log.info("API listening on http://%s:%s", s.sentinel_bind_host, server.port)
 
-            for monitor in (TelemetryMonitor(s.telemetry_interval_s),
-                            SelfHeartbeat(s.heartbeat_interval_s),
-                            Housekeeping()):
+            for monitor in (TelemetryMonitor(services.config),
+                            SelfHeartbeat(services.config),
+                            Housekeeping(services.config)):
                 monitor_tasks.append(asyncio.create_task(
                     self._supervise(monitor.name, lambda m=monitor: m.run(ctx), log),
                     name=f"monitor:{monitor.name}"))

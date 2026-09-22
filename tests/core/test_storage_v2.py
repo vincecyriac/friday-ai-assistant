@@ -24,7 +24,7 @@ def test_v1_database_upgrades_to_v2_with_rows_intact(tmp_path, monkeypatch):
 
     s = Store.open(path)
     try:
-        assert s.schema_version() == 2
+        assert s.schema_version() == 3
         assert s.kv_get("k") == 1
         assert s.list_events()[0].event.id == "keep"
         names = {r[0] for r in s.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}

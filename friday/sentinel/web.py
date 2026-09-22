@@ -10,12 +10,15 @@ served. Origin is checked against Host as a second layer.
 from __future__ import annotations
 
 import asyncio
+import json
+import secrets
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 from aiohttp import web
 
+from friday.sentinel.assistant import DEFAULT_TITLE, run_turn
 from friday.sentinel.auth import (SESSION_COOKIE, Node, User, client_ip, hash_password, is_https,
                                   token_hash, verify_password)
 from friday.sentinel.principals import require_principal, require_user, resolve_principal
@@ -84,11 +87,11 @@ async def login(request: web.Request) -> web.Response:
     now = time.time()
     if not ok:
         svc.limiter.record_failure(ip)
-        await svc.store.audit_append(now, f"ip:{ip}", "login.failed", username or None, {})
+        await svc.audit(f"ip:{ip}", "login.failed", username or None, {})
         return _error(401, "invalid username or password")
     svc.limiter.reset(ip)
     token = await svc.sessions.create(username, user_agent=request.headers.get("User-Agent"), ip=ip)
-    await svc.store.audit_append(now, f"user:{username}", "login.ok", None, {"ip": ip})
+    await svc.audit(f"user:{username}", "login.ok", None, {"ip": ip})
     resp = web.Response(status=204)
     resp.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="Lax", path="/",
                     max_age=int(svc.sessions.ttl_s), secure=is_https(request, svc.settings.trusted_proxy))
@@ -102,7 +105,7 @@ async def logout(request: web.Request) -> web.Response:
     user = await require_user(request)
     svc = request.app[SERVICES]
     await svc.sessions.revoke(request.cookies.get(SESSION_COOKIE, ""))
-    await svc.store.audit_append(time.time(), f"user:{user.username}", "logout", None, {})
+    await svc.audit(f"user:{user.username}", "logout", None, {})
     resp = web.Response(status=204)
     resp.del_cookie(SESSION_COOKIE, path="/")
     return resp
@@ -185,7 +188,7 @@ async def tokens_create(request: web.Request) -> web.Response:
         return _error(400, f"name must be 1-{MAX_TOKEN_NAME} characters")
     svc = request.app[SERVICES]
     id_, token = await svc.node_tokens.create(name)
-    await svc.store.audit_append(time.time(), f"user:{user.username}", "token.create", id_, {"name": name})
+    await svc.audit(f"user:{user.username}", "token.create", id_, {"name": name})
     return web.json_response({"id": id_, "name": name, "token": token}, status=201)
 
 
@@ -198,7 +201,7 @@ async def tokens_revoke(request: web.Request) -> web.Response:
     id_ = request.match_info["id"]
     if not await svc.node_tokens.revoke(id_):
         return _error(404, "no such active token")
-    await svc.store.audit_append(time.time(), f"user:{user.username}", "token.revoke", id_, {})
+    await svc.audit(f"user:{user.username}", "token.revoke", id_, {})
     return web.Response(status=204)
 
 
@@ -218,6 +221,137 @@ async def audit(request: web.Request) -> web.Response:
                                "target": r.target, "detail": r.detail} for r in rows])
 
 
+# ----------------------------------------------------------------- events
+
+def _float_query(request: web.Request, name: str) -> float | None:
+    raw = request.query.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        raise web.HTTPBadRequest(text=json.dumps({"error": f"{name} must be a number"}),
+                                 content_type="application/json") from None
+
+
+async def events_list(request: web.Request) -> web.Response:
+    await require_user(request)
+    try:
+        limit = int(request.query.get("limit", "100"))
+    except ValueError:
+        return _error(400, "limit must be an integer")
+    if not 1 <= limit <= 500:
+        return _error(400, "limit must be between 1 and 500")
+    since, before = _float_query(request, "since"), _float_query(request, "before")
+    rows = await request.app[SERVICES].store.list_events(
+        type_glob=request.query.get("type") or "*", source=request.query.get("source") or None,
+        since_ts=since, before_ts=before, limit=limit)
+    return web.json_response([{
+        "id": r.event.id, "ts": r.event.ts, "type": r.event.type, "source": r.event.source,
+        "payload": r.event.payload, "priority": r.event.priority, "status": r.status} for r in rows])
+
+
+async def telemetry_all(request: web.Request) -> web.Response:
+    await require_principal(request)
+    return web.json_response({"nodes": await request.app[SERVICES].store.telemetry_latest_all()})
+
+
+# ------------------------------------------------------------------ chat
+
+MAX_CHAT_CONTENT = 8000
+
+
+def _conversation_dict(row) -> dict:
+    return {"id": row.id, "title": row.title, "created_at": row.created_at,
+            "updated_at": row.updated_at, "message_count": row.message_count}
+
+
+def _message_dict(row) -> dict:
+    return {"id": row.id, "seq": row.seq, "role": row.role, "content": row.content,
+            "tool_name": row.tool_name, "tool_args": row.tool_args, "tool_result": row.tool_result,
+            "status": row.status, "ts": row.ts}
+
+
+async def chat_list(request: web.Request) -> web.Response:
+    await require_user(request)
+    rows = await request.app[SERVICES].store.conversations_list()
+    return web.json_response([_conversation_dict(r) for r in rows])
+
+
+async def chat_create(request: web.Request) -> web.Response:
+    denied = _csrf_check(request)
+    if denied is not None:
+        return denied
+    await require_user(request)
+    try:
+        data = await request.json()
+    except ValueError:
+        return _error(400, "body is not valid JSON")
+    title = str((data or {}).get("title") or "").strip() if isinstance(data, dict) else ""
+    row = await request.app[SERVICES].store.conversation_create(
+        secrets.token_hex(8), title[:60] or DEFAULT_TITLE, time.time())
+    return web.json_response(_conversation_dict(row), status=201)
+
+
+async def chat_get(request: web.Request) -> web.Response:
+    await require_user(request)
+    store = request.app[SERVICES].store
+    conv = await store.conversation_get(request.match_info["id"])
+    if conv is None:
+        return _error(404, "no such conversation")
+    messages = await store.messages_list(conv.id)
+    return web.json_response({"conversation": _conversation_dict(conv),
+                              "messages": [_message_dict(m) for m in messages]})
+
+
+async def chat_delete(request: web.Request) -> web.Response:
+    denied = _csrf_check(request)
+    if denied is not None:
+        return denied
+    await require_user(request)
+    svc = request.app[SERVICES]
+    if not await svc.store.conversation_delete(request.match_info["id"]):
+        return _error(404, "no such conversation")
+    svc.chat_locks.pop(request.match_info["id"], None)
+    return web.Response(status=204)
+
+
+async def chat_message(request: web.Request) -> web.StreamResponse:
+    denied = _csrf_check(request)
+    if denied is not None:
+        return denied
+    user = await require_user(request)
+    svc = request.app[SERVICES]
+    conv_id = request.match_info["id"]
+    if await svc.store.conversation_get(conv_id) is None:
+        return _error(404, "no such conversation")
+    try:
+        data = await request.json()
+    except ValueError:
+        return _error(400, "body is not valid JSON")
+    content = str((data or {}).get("content") or "").strip() if isinstance(data, dict) else ""
+    if not 1 <= len(content) <= MAX_CHAT_CONTENT:
+        return _error(400, f"content must be 1-{MAX_CHAT_CONTENT} characters")
+    lock = svc.chat_locks.setdefault(conv_id, asyncio.Lock())
+    if lock.locked():
+        return _error(409, "a turn is in progress")
+    async with lock:
+        resp = web.StreamResponse(status=200, headers={
+            "Content-Type": "application/x-ndjson", "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no"})
+        await resp.prepare(request)
+
+        async def emit(obj: dict) -> None:
+            await resp.write((json.dumps(obj) + "\n").encode("utf-8"))
+
+        await run_turn(svc, conversation_id=conv_id, user=user, text=content, emit=emit)
+        try:
+            await resp.write_eof()
+        except ConnectionResetError:
+            pass
+        return resp
+
+
 # ---------------------------------------------------------------- config
 
 async def config_pull(request: web.Request) -> web.Response:
@@ -228,7 +362,7 @@ async def config_pull(request: web.Request) -> web.Response:
         return _error(400, f"unknown scope {scope!r}")
     values = svc.config.view_for_scope(scope)
     actor = f"node:{principal.name}" if isinstance(principal, Node) else f"user:{principal.username}"
-    await svc.store.audit_append(time.time(), actor, "config.pull", None,
+    await svc.audit(actor, "config.pull", None,
                                  {"scope": scope, "keys": sorted(values)})
     return web.json_response({"scope": scope, "values": values, "generated_at": time.time()})
 
@@ -258,9 +392,20 @@ def add_web_routes(app: web.Application, static_dir: Path | None) -> None:
         web.post("/api/tokens", tokens_create),
         web.delete("/api/tokens/{id}", tokens_revoke),
         web.get("/api/audit", audit),
+        web.get("/api/chat", chat_list),
+        web.post("/api/chat", chat_create),
+        web.get("/api/chat/{id}", chat_get),
+        web.delete("/api/chat/{id}", chat_delete),
+        web.post("/api/chat/{id}/messages", chat_message),
+        web.get("/api/events", events_list),
+        web.get("/api/telemetry", telemetry_all),
         web.get("/config", config_pull),
         web.get("/", shell),
         web.get("/login", shell),
+        web.get("/overview", shell),
+        web.get("/activity", shell),
+        web.get("/controls", shell),
+        web.get("/assistant", shell),
         web.get("/settings", shell),
         web.get("/tokens", shell),
     ])

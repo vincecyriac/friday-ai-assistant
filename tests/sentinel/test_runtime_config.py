@@ -121,3 +121,11 @@ async def test_undecryptable_secret_is_treated_as_unset(rig, caplog):
     assert sum("cannot decrypt" in r.getMessage() for r in caplog.records) == 1
     view = {item["key"]: item for item in rig.config.view_for_user()}
     assert view["llm.tripo_api_key"]["source"] == "undecryptable" and view["llm.tripo_api_key"]["set"] is False
+
+
+async def test_settings_writes_publish_audit_entry(rig):
+    await rig.config.set_many({"controls.dnd": True}, actor="dashboard:vince")
+    await rig.config.unset("controls.dnd", actor="dashboard:vince")
+    entries = await rig.store.list_events(type="audit.entry")
+    assert [e.event.payload["action"] for e in entries] == ["settings.unset", "settings.update"]
+    assert entries[0].event.payload["actor"] == "dashboard:vince"

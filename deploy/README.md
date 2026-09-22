@@ -23,6 +23,20 @@ Gemini key under **Settings → llm**. The desktop pulls it on its next boot.
 Behind Caddy/Nginx/Tailscale Serve set `FRIDAY_TRUSTED_PROXY=true` so the
 session cookie is marked `Secure` from the forwarded scheme.
 
+## Dashboard
+
+`http://127.0.0.1:8770/` (or the Tailscale URL). Overview shows every node's
+heartbeat and telemetry tiles; Activity streams the event bus (heartbeats,
+telemetry, audit entries, config changes — later triage); Controls holds the call
+mode, do-not-disturb, monitor switches and the sentinel's intervals (live, no
+restart); Assistant is a text chat with FRIDAY that can read the same data and flip
+the controls. Settings and Nodes & tokens are unchanged.
+
+The dashboard is static files under `friday/sentinel/dashboard/`; `tailwind.css`
+is committed. After editing any class in the HTML/JS run `deploy/build_css.sh`
+(downloads the Tailwind 3.4.17 standalone binary into `.cache/` once; no Node
+needed) — `tests/sentinel/test_dashboard_files.py` fails on a stale build.
+
 ## Linux (Fedora, Raspberry Pi OS): systemd
 
 ```bash
@@ -61,6 +75,9 @@ FRIDAY_SENTINEL_URL=https://<host>.<tailnet>.ts.net/sentinel
 FRIDAY_SENTINEL_TOKEN=<token from "friday-sentinel token create desktop">
 ```
 
+The dashboard's WebSocket (`/ws`) also goes through the proxy; Tailscale Serve
+passes it as-is.
+
 `setup_remote.sh` in this directory is the existing script for exposing the
 **desktop hub** the same way; it is unchanged.
 
@@ -78,6 +95,10 @@ FRIDAY_SENTINEL_TOKEN=<token from "friday-sentinel token create desktop">
 | `GET/POST /api/tokens`, `DELETE /api/tokens/{id}` | session | node tokens (plaintext shown once) |
 | `GET /api/audit` | session | who changed what |
 | `GET /config?scope=desktop` | node token or session | decrypted config for a node scope; audited |
+| `GET /api/events?type=&source=&since=&before=&limit=` | session | events, newest first (type is a glob) |
+| `GET /api/telemetry` | node token or session | latest snapshot per node |
+| `GET/POST /api/chat`, `GET/DELETE /api/chat/{id}` | session | assistant conversations |
+| `POST /api/chat/{id}/messages` | session | one turn; `application/x-ndjson` stream of `delta` / `tool` / `result` / `error` / `done` |
 
 Node tokens go in `Authorization: Bearer fn_…`. State-changing dashboard
 calls (`POST`/`PUT`/`DELETE`) must also send `X-FRIDAY-Client: dashboard`.

@@ -27,3 +27,6 @@ data/
 # Build output
 build/
 dist/
+
+# Tailwind standalone binary cache (deploy/build_css.sh)
+.cache/

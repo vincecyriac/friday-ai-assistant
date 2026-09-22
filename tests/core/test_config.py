@@ -175,3 +175,11 @@ def test_apply_overrides_maps_registry_keys(make_settings):
     assert "nonsense" not in out.llm_routes
     assert out.node_id == s.node_id                     # untouched fields survive
     assert s.gemini_api_key == "old"                    # input is not mutated
+
+
+def test_assistant_role_exists_with_default(make_settings):
+    from friday.core.config import LLM_ROLES
+    assert "assistant" in LLM_ROLES
+    assert make_settings().llm_routes["assistant"] == "gemini:gemini-3.7-flash"
+    assert make_settings(FRIDAY_LLM_ASSISTANT="gemini:x").llm_routes["assistant"] == "gemini:x"
+    assert apply_overrides(make_settings(), {"llm.routes.assistant": "gemini:y"}).llm_routes["assistant"] == "gemini:y"

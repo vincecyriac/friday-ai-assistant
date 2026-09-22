@@ -22,13 +22,14 @@ from dotenv import dotenv_values
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Every LLM call site names a role; the role maps to "provider:model" via env.
-LLM_ROLES = ("live", "agent_os", "agent_spatial", "widget", "triage")
+LLM_ROLES = ("live", "agent_os", "agent_spatial", "widget", "triage", "assistant")
 DEFAULT_LLM_ROUTES: Mapping[str, str] = {
     "live": "gemini:gemini-3.1-flash-live-preview",
     "agent_os": "gemini:gemini-3.8-flash",
     "agent_spatial": "gemini:gemini-3.8-flash",
     "widget": "gemini:gemini-3.7-flash",
     "triage": "gemini:gemini-3.7-flash",
+    "assistant": "gemini:gemini-3.7-flash",
 }
 
 SYNC_MODES = ("FULL", "NORMAL")

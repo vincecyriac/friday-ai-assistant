@@ -19,8 +19,8 @@ from friday.sentinel.sdnotify import sd_notify
 class TelemetryMonitor:
     name = "telemetry"
 
-    def __init__(self, interval_s: float):
-        self.interval_s = interval_s
+    def __init__(self, config):
+        self.config = config            # RuntimeConfig; read every tick so edits apply live
 
     async def run(self, ctx: HandlerContext) -> None:
         # cpu_percent measures since its previous call; the first call is always 0.
@@ -32,14 +32,14 @@ class TelemetryMonitor:
                 None, partial(collect, settings.node_id, settings.data_dir))
             await ctx.bus.publish(Event(type="telemetry.sample", source=settings.node_id,
                                         payload=snapshot.to_dict()))
-            await asyncio.sleep(self.interval_s)
+            await asyncio.sleep(float(self.config.get("sentinel.telemetry_interval_s")))
 
 
 class SelfHeartbeat:
     name = "heartbeat"
 
-    def __init__(self, interval_s: float):
-        self.interval_s = interval_s
+    def __init__(self, config):
+        self.config = config
 
     async def run(self, ctx: HandlerContext) -> None:
         platform = detect().summary
@@ -48,21 +48,25 @@ class SelfHeartbeat:
             hb = Heartbeat(status="running", version=friday.__version__, platform=platform)
             await ctx.bus.publish(Event(type="node.heartbeat", source=node_id, payload=hb.to_dict()))
             sd_notify("WATCHDOG=1")
-            await asyncio.sleep(self.interval_s)
+            await asyncio.sleep(float(self.config.get("sentinel.heartbeat_interval_s")))
 
 
 class Housekeeping:
     name = "housekeeping"
 
-    def __init__(self, interval_s: float = 3600.0):
+    def __init__(self, config, interval_s: float = 3600.0):
+        self.config = config
         self.interval_s = interval_s
 
     async def run(self, ctx: HandlerContext) -> None:
         while True:
             await asyncio.sleep(self.interval_s)          # nothing to prune at boot
             now = time.time()
-            counts = await ctx.store.prune(now - ctx.settings.retention_days * 86400)
+            retention_days = float(self.config.get("sentinel.retention_days"))
+            chat_days = float(self.config.get("sentinel.chat_retention_days"))
+            counts = await ctx.store.prune(now - retention_days * 86400)
             sessions = await ctx.store.sessions_prune(now)
+            chats = await ctx.store.conversations_prune(now - chat_days * 86400)
             await ctx.store.checkpoint("PASSIVE")
-            ctx.logger.info("housekeeping: pruned %d telemetry rows, %d events, %d sessions",
-                            counts["telemetry"], counts["events"], sessions)
+            ctx.logger.info("housekeeping: pruned %d telemetry rows, %d events, %d sessions, %d chats",
+                            counts["telemetry"], counts["events"], sessions, chats)

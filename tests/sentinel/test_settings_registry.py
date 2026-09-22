@@ -66,9 +66,45 @@ def test_generic_types():
 
 def test_schema_has_groups_and_no_values():
     groups = schema()
-    assert [g["name"] for g in groups] == ["llm", "desktop", "controls"]
+    assert [g["name"] for g in groups] == ["llm", "desktop", "sentinel", "controls"]
     flat = json.dumps(groups)
     assert "value" not in flat
     key = next(k for g in groups for k in g["keys"] if k["key"] == "controls.call_mode")
     assert key["type"] == "enum" and key["choices"] == ["always", "urgent_only", "mute"]
     assert key["secret"] is False and "description" in key
+
+
+def test_sentinel_and_monitor_keys():
+    from friday.sentinel.settings_registry import GROUP_ORDER
+    assert GROUP_ORDER == ("llm", "desktop", "sentinel", "controls")
+    assert spec_for("sentinel.telemetry_interval_s").env == "FRIDAY_TELEMETRY_INTERVAL"
+    assert spec_for("sentinel.telemetry_interval_s").default == 15.0
+    assert spec_for("sentinel.heartbeat_interval_s").default == 30.0
+    assert spec_for("sentinel.retention_days").default == 14
+    assert spec_for("sentinel.chat_retention_days").default == 90 and spec_for("sentinel.chat_retention_days").env is None
+    for name in ("email", "calendar", "jira"):
+        assert spec_for(f"controls.monitors.{name}").type == "bool" and spec_for(f"controls.monitors.{name}").default is False
+    assert spec_for("llm.routes.assistant").default == "gemini:gemini-3.7-flash"
+    assert spec_for("llm.routes.assistant").scopes == () and spec_for("llm.routes.assistant").env == "FRIDAY_LLM_ASSISTANT"
+    assert [g["name"] for g in schema()] == ["llm", "desktop", "sentinel", "controls"]
+
+
+@pytest.mark.parametrize("key,raw,expected", [
+    ("sentinel.telemetry_interval_s", "2.5", 2.5),
+    ("sentinel.retention_days", "30", 30),
+    ("controls.monitors.email", "on", True),
+])
+def test_new_keys_validate(key, raw, expected):
+    assert validate(spec_for(key), raw) == expected
+
+
+@pytest.mark.parametrize("key,raw", [
+    ("sentinel.telemetry_interval_s", "0.5"),
+    ("sentinel.telemetry_interval_s", "4000"),
+    ("sentinel.retention_days", "0"),
+    ("sentinel.chat_retention_days", "9999"),
+])
+def test_new_keys_reject_out_of_range(key, raw):
+    with pytest.raises(SettingValidationError) as excinfo:
+        validate(spec_for(key), raw)
+    assert "between" in str(excinfo.value)

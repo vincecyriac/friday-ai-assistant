@@ -130,7 +130,7 @@ async def test_origin_must_match_host(client):
 async def test_settings_schema_get_put(client, services):
     await login(client)
     schema = await (await client.get("/api/settings/schema")).json()
-    assert [g["name"] for g in schema["groups"]] == ["llm", "desktop", "controls"]
+    assert [g["name"] for g in schema["groups"]] == ["llm", "desktop", "sentinel", "controls"]
 
     values = {v["key"]: v for v in (await (await client.get("/api/settings")).json())["values"]}
     assert values["llm.gemini_api_key"] == {"key": "llm.gemini_api_key", "secret": True, "set": False,
@@ -240,3 +240,10 @@ async def test_ws_accepts_session_cookie(client, services):
     await services.bus.publish(Event(type="a.b", source="s"))
     assert (await asyncio.wait_for(ws.receive_json(), 2))["type"] == "a.b"
     await ws.close()
+
+
+async def test_login_audit_is_published_as_event(client, services):
+    await login(client, "wrong")
+    await login(client)
+    entries = await services.store.list_events(type="audit.entry")
+    assert [e.event.payload["action"] for e in entries] == ["login.ok", "login.failed"]

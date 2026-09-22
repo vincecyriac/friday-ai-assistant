@@ -15,19 +15,6 @@ MODULES = [
 ]
 
 
-@pytest.fixture(scope="module", autouse=True)
-def desktop_data_dir(tmp_path_factory):
-    """One data dir for the whole module: the desktop modules bake paths in at import."""
-    from friday.core import config
-
-    data_dir = tmp_path_factory.mktemp("desktop-data").resolve()
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("FRIDAY_DATA_DIR", str(data_dir))
-        config.get_settings.cache_clear()
-        yield data_dir
-    config.get_settings.cache_clear()
-
-
 @pytest.mark.parametrize("module", MODULES)
 def test_module_imports(module):
     importlib.import_module(module)

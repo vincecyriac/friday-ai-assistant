@@ -1,4 +1,5 @@
 import os
+from functools import partial
 from pathlib import Path
 os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
 import sys
@@ -31,6 +32,7 @@ from friday.core.config import get_settings, override_settings
 from friday.core.events import Event, Heartbeat
 from friday.core.llm import gemini_client, resolve
 from friday.core.platform import detect
+from friday.core.telemetry import collect
 from friday.desktop import config_pull
 from friday.desktop.sentinel_client import SentinelClient
 from google.genai import types
@@ -295,6 +297,13 @@ async def sentinel_heartbeat_task():
                            meta={"remote_clients": len(remote_ws_clients)})
             await client.post(Event(type="node.heartbeat", source=settings.node_id,
                                     payload=hb.to_dict()))
+            try:
+                snapshot = await asyncio.get_running_loop().run_in_executor(
+                    None, partial(collect, settings.node_id, settings.data_dir))
+                await client.post(Event(type="telemetry.sample", source=settings.node_id,
+                                        payload=snapshot.to_dict()))
+            except Exception as e:                       # telemetry is best-effort
+                log_info(f"Telemetry sample skipped: {e}")
             if not await sleep_unless_shutdown(settings.heartbeat_interval_s):
                 break
     finally:

@@ -14,7 +14,7 @@ from typing import Any, Callable
 from friday.core.config import ConfigError
 from friday.core.llm.routing import parse_route
 
-GROUP_ORDER = ("llm", "desktop", "controls")
+GROUP_ORDER = ("llm", "desktop", "sentinel", "controls")
 
 
 class SettingValidationError(ValueError):
@@ -52,6 +52,14 @@ def _route_spec(role: str, default: str, *, scopes: tuple[str, ...]) -> SettingS
         default=default, scopes=scopes, env=f"FRIDAY_LLM_{role.upper()}", validator=_route)
 
 
+def _range(lo: float, hi: float) -> Callable[[Any], Any]:
+    def check(value: Any) -> Any:
+        if not lo <= value <= hi:
+            raise ValueError(f"must be between {lo:g} and {hi:g}")
+        return value
+    return check
+
+
 REGISTRY: tuple[SettingSpec, ...] = (
     SettingSpec("llm.gemini_api_key", "str", "llm", "Google Gemini API key",
                 secret=True, scopes=("desktop",), env="GEMINI_API_KEY"),
@@ -60,6 +68,7 @@ REGISTRY: tuple[SettingSpec, ...] = (
     _route_spec("agent_spatial", "gemini:gemini-3.8-flash", scopes=("desktop",)),
     _route_spec("widget", "gemini:gemini-3.7-flash", scopes=("desktop",)),
     _route_spec("triage", "gemini:gemini-3.7-flash", scopes=()),
+    _route_spec("assistant", "gemini:gemini-3.7-flash", scopes=()),
     SettingSpec("llm.tripo_api_key", "str", "llm", "Tripo3D API key (text-to-3D); optional",
                 secret=True, scopes=("desktop",), env="TRIPO_API_KEY"),
     SettingSpec("desktop.voice", "str", "desktop", "Gemini Live voice for the desktop (Aoede or Kore)",
@@ -69,6 +78,24 @@ REGISTRY: tuple[SettingSpec, ...] = (
                 default="urgent_only", choices=("always", "urgent_only", "mute")),
     SettingSpec("controls.dnd", "bool", "controls", "Do not disturb: suppress calls and pings",
                 default=False),
+    SettingSpec("sentinel.telemetry_interval_s", "float", "sentinel",
+                "Seconds between telemetry samples on the sentinel host",
+                default=15.0, env="FRIDAY_TELEMETRY_INTERVAL", validator=_range(1, 3600)),
+    SettingSpec("sentinel.heartbeat_interval_s", "float", "sentinel",
+                "Seconds between the sentinel's own heartbeats (also the watchdog ping)",
+                default=30.0, env="FRIDAY_HEARTBEAT_INTERVAL", validator=_range(1, 3600)),
+    SettingSpec("sentinel.retention_days", "int", "sentinel",
+                "Days of telemetry and finished events to keep",
+                default=14, env="FRIDAY_RETENTION_DAYS", validator=_range(1, 365)),
+    SettingSpec("sentinel.chat_retention_days", "int", "sentinel",
+                "Days an idle assistant conversation is kept",
+                default=90, validator=_range(1, 3650)),
+    SettingSpec("controls.monitors.email", "bool", "controls",
+                "Watch the mailbox (read + drafts); arrives with the monitors release", default=False),
+    SettingSpec("controls.monitors.calendar", "bool", "controls",
+                "Watch the calendar and guard meetings; arrives with the monitors release", default=False),
+    SettingSpec("controls.monitors.jira", "bool", "controls",
+                "Watch Jira for blockers (read-only); arrives with the monitors release", default=False),
 )
 
 _BY_KEY = {spec.key: spec for spec in REGISTRY}

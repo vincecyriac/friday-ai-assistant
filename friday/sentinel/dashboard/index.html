@@ -1,24 +1,41 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>FRIDAY Sentinel</title>
-  <link rel="stylesheet" href="static/style.css">
+  <title>FRIDAY</title>
+  <link rel="stylesheet" href="static/tailwind.css">
 </head>
-<body>
-  <div id="app" class="app">
-    <header class="topbar">
-      <div class="brand"><span class="orb"></span> FRIDAY <span class="dim">sentinel</span></div>
-      <nav id="nav" class="nav hidden">
-        <a href="settings" data-view="settings">Settings</a>
-        <a href="tokens" data-view="tokens">Nodes &amp; tokens</a>
-        <button id="logout" class="ghost">Sign out</button>
-      </nav>
-    </header>
-    <main id="main" class="main"></main>
-    <div id="toast" class="toast hidden"></div>
+<body class="min-h-screen bg-zinc-950 text-zinc-100">
+  <div id="app" class="flex min-h-screen">
+    <aside id="sidebar" class="hidden w-60 shrink-0 flex-col border-r border-zinc-800 bg-zinc-950 px-3 py-4">
+      <div class="flex items-center gap-2 px-3 pb-4">
+        <span class="dot bg-zinc-300"></span>
+        <span class="font-semibold tracking-wide">FRIDAY</span>
+        <span id="brand-node" class="truncate text-xs text-zinc-400"></span>
+      </div>
+      <nav id="nav" class="flex flex-col gap-1"></nav>
+      <div class="mt-auto flex items-center justify-between px-3 pt-4 text-xs text-zinc-400">
+        <span id="user-name" class="truncate"></span>
+        <button id="logout" class="btn btn-ghost px-2 py-1">Sign out</button>
+      </div>
+    </aside>
+    <div class="flex min-w-0 flex-1 flex-col">
+      <header class="flex items-center justify-between border-b border-zinc-800 px-4 py-3 md:px-8">
+        <div class="flex items-center gap-3">
+          <span class="font-semibold tracking-wide md:hidden">FRIDAY</span>
+          <h1 id="view-title" class="text-base font-semibold"></h1>
+        </div>
+        <div class="flex items-center gap-3 text-xs text-zinc-400">
+          <span id="conn" class="badge badge-zinc"><span id="conn-dot" class="dot bg-zinc-500"></span><span id="conn-text">offline</span></span>
+          <span id="version" class="font-mono"></span>
+        </div>
+      </header>
+      <nav id="tabs" class="hidden gap-1 overflow-x-auto border-b border-zinc-800 px-2 py-2 md:hidden"></nav>
+      <main id="view" class="flex-1 px-4 py-6 md:px-8"></main>
+    </div>
   </div>
-  <script src="static/app.js"></script>
+  <div id="toast" class="toast hidden"></div>
+  <script type="module" src="static/app.js"></script>
 </body>
 </html>

@@ -9,10 +9,10 @@ from __future__ import annotations
 from typing import Any
 
 from friday.core.config import ConfigError, Settings
-from friday.core.llm.base import LLMProvider, LLMResponse, ToolCall
+from friday.core.llm.base import Chunk, LLMProvider, LLMResponse, Message, ToolCall
 from friday.core.llm.routing import Route, parse_route, resolve
 
-__all__ = ["LLMProvider", "LLMResponse", "Route", "ToolCall", "gemini_client",
+__all__ = ["Chunk", "LLMProvider", "LLMResponse", "Message", "Route", "ToolCall", "gemini_client",
            "get_provider", "parse_route", "resolve"]
 
 _gemini_clients: dict[str, Any] = {}

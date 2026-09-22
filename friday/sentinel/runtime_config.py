@@ -17,6 +17,7 @@ from friday.core.events import Event
 from friday.core.llm.routing import parse_route
 from friday.core.storage import AsyncStore, SettingRow
 from friday.core.vault import Vault, VaultError
+from friday.sentinel.audit import record
 from friday.sentinel.settings_registry import (REGISTRY, SettingSpec, SettingValidationError,
                                                spec_for, validate)
 
@@ -46,7 +47,13 @@ def legacy_value(spec: SettingSpec, settings: Settings) -> Any | None:
     if spec.env is None:
         return None
     raw = settings.env.get(spec.env)
-    return raw.strip() if raw and raw.strip() else None
+    if not raw or not raw.strip():
+        return None
+    try:
+        return validate(spec, raw.strip())
+    except SettingValidationError:
+        log.warning("ignoring malformed legacy value for %s: %r", spec.key, raw)
+        return None
 
 
 class RuntimeConfig:
@@ -126,16 +133,16 @@ class RuntimeConfig:
         for key, (spec, value) in cleaned.items():
             stored = self._vault.encrypt(key, str(value)) if spec.secret else json.dumps(value)
             await self._store.setting_set(key, stored, secret=spec.secret, updated_by=actor, ts=now)
-            await self._store.audit_append(now, actor, "settings.update", key,
-                                           {"secret": True} if spec.secret else {"value": value})
+            await record(self._store, self._bus, self._settings.node_id, actor, "settings.update", key,
+                         {"secret": True} if spec.secret else {"value": value})
         await self.load()
         await self._publish(sorted(cleaned), actor)
 
     async def unset(self, key: str, *, actor: str) -> None:
         spec = spec_for(key)
         if await self._store.setting_delete(key):
-            now = time.time()
-            await self._store.audit_append(now, actor, "settings.unset", key, {"secret": spec.secret})
+            await record(self._store, self._bus, self._settings.node_id, actor, "settings.unset", key,
+                         {"secret": spec.secret})
             await self.load()
             await self._publish([key], actor)
 

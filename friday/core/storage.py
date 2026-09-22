@@ -74,6 +74,18 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "  action TEXT NOT NULL, target TEXT, detail TEXT NOT NULL)",
         "CREATE INDEX audit_ts ON audit(ts DESC)",
     ),
+    3: (
+        "CREATE TABLE conversations ("
+        "  id TEXT PRIMARY KEY, title TEXT NOT NULL,"
+        "  created_at REAL NOT NULL, updated_at REAL NOT NULL)",
+        "CREATE INDEX conversations_updated ON conversations(updated_at DESC)",
+        "CREATE TABLE messages ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL,"
+        "  seq INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,"
+        "  tool_name TEXT, tool_args TEXT, tool_result TEXT,"
+        "  status TEXT NOT NULL DEFAULT 'complete', ts REAL NOT NULL)",
+        "CREATE UNIQUE INDEX messages_conv_seq ON messages(conversation_id, seq)",
+    ),
 }
 
 _EVENT_COLUMNS = "id, ts, source, type, payload, priority, status, attempts, error, claimed_at, processed_at"
@@ -142,6 +154,61 @@ class AuditRow:
     action: str
     target: str | None
     detail: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ConversationRow:
+    id: str
+    title: str
+    created_at: float
+    updated_at: float
+    message_count: int
+
+
+@dataclass(frozen=True)
+class MessageRow:
+    id: int
+    conversation_id: str
+    seq: int
+    role: str
+    content: str
+    tool_name: str | None
+    tool_args: dict | None
+    tool_result: str | None
+    status: str
+    ts: float
+
+
+def _glob_to_like(glob: str) -> str:
+    out = []
+    for ch in glob:
+        if ch == "*":
+            out.append("%")
+        elif ch == "?":
+            out.append("_")
+        elif ch in "%_\\":
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+_CONVERSATION_SELECT = (
+    "SELECT c.id, c.title, c.created_at, c.updated_at, "
+    "(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count "
+    "FROM conversations c")
+_MESSAGE_COLUMNS = "id, conversation_id, seq, role, content, tool_name, tool_args, tool_result, status, ts"
+
+
+def _row_to_conversation(row: sqlite3.Row) -> ConversationRow:
+    return ConversationRow(row["id"], row["title"], row["created_at"], row["updated_at"],
+                           int(row["message_count"]))
+
+
+def _row_to_message(row: sqlite3.Row) -> MessageRow:
+    return MessageRow(row["id"], row["conversation_id"], row["seq"], row["role"], row["content"],
+                      row["tool_name"], json.loads(row["tool_args"]) if row["tool_args"] else None,
+                      row["tool_result"], row["status"], row["ts"])
 
 
 def _row_to_stored(row: sqlite3.Row) -> StoredEvent:
@@ -346,18 +413,31 @@ class Store:
         return depths
 
     def list_events(self, *, type: str | None = None, status: str | None = None,
-                    limit: int = 100) -> list[StoredEvent]:
+                    limit: int = 100, type_glob: str | None = None, source: str | None = None,
+                    since_ts: float | None = None, before_ts: float | None = None) -> list[StoredEvent]:
         clauses: list[str] = []
         params: list[Any] = []
         if type is not None:
             clauses.append("type = ?")
             params.append(type)
+        if type_glob is not None and type_glob != "*":
+            clauses.append("type LIKE ? ESCAPE '\\'")
+            params.append(_glob_to_like(type_glob))
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if since_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(since_ts)
+        if before_ts is not None:
+            clauses.append("ts < ?")
+            params.append(before_ts)
         if status is not None:
             clauses.append("status = ?")
             params.append(status)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._conn.execute(
-            f"SELECT {_EVENT_COLUMNS} FROM events {where} ORDER BY created_at DESC LIMIT ?",
+            f"SELECT {_EVENT_COLUMNS} FROM events {where} ORDER BY ts DESC, id LIMIT ?",
             (*params, limit)).fetchall()
         return [_row_to_stored(r) for r in rows]
 
@@ -383,6 +463,13 @@ class Store:
             return int(self._conn.execute("SELECT COUNT(*) FROM telemetry").fetchone()[0])
         return int(self._conn.execute(
             "SELECT COUNT(*) FROM telemetry WHERE node_id = ?", (node_id,)).fetchone()[0])
+
+    def telemetry_latest_all(self) -> dict[str, dict]:
+        rows = self._conn.execute(
+            "SELECT t.node_id, t.snapshot FROM telemetry t "
+            "JOIN (SELECT node_id, MAX(ts) AS ts FROM telemetry GROUP BY node_id) m "
+            "  ON m.node_id = t.node_id AND m.ts = t.ts").fetchall()
+        return {r["node_id"]: json.loads(r["snapshot"]) for r in rows}
 
     def prune(self, older_than_ts: float) -> dict[str, int]:
         """Drop old telemetry and finished events. Pending/processing are never touched."""
@@ -512,6 +599,86 @@ class Store:
         return [AuditRow(r["id"], r["ts"], r["actor"], r["action"], r["target"], json.loads(r["detail"]))
                 for r in rows]
 
+    # --------------------------------------------------------- conversations
+
+    def conversation_create(self, id: str, title: str, ts: float) -> ConversationRow:
+        self._conn.execute(
+            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (id, title, ts, ts))
+        return ConversationRow(id, title, ts, ts, 0)
+
+    def conversation_get(self, id: str) -> ConversationRow | None:
+        row = self._conn.execute(f"{_CONVERSATION_SELECT} WHERE c.id = ?", (id,)).fetchone()
+        return None if row is None else _row_to_conversation(row)
+
+    def conversations_list(self, limit: int = 50) -> list[ConversationRow]:
+        rows = self._conn.execute(
+            f"{_CONVERSATION_SELECT} ORDER BY c.updated_at DESC LIMIT ?", (limit,)).fetchall()
+        return [_row_to_conversation(r) for r in rows]
+
+    def conversation_touch(self, id: str, ts: float, title: str | None = None) -> None:
+        if title is None:
+            self._conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (ts, id))
+        else:
+            self._conn.execute("UPDATE conversations SET updated_at = ?, title = ? WHERE id = ?",
+                               (ts, title, id))
+
+    def conversation_delete(self, id: str) -> bool:
+        c = self._conn
+        c.execute("BEGIN")
+        try:
+            c.execute("DELETE FROM messages WHERE conversation_id = ?", (id,))
+            deleted = c.execute("DELETE FROM conversations WHERE id = ?", (id,)).rowcount > 0
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+        return deleted
+
+    def conversations_prune(self, idle_before_ts: float) -> int:
+        c = self._conn
+        c.execute("BEGIN")
+        try:
+            c.execute("DELETE FROM messages WHERE conversation_id IN "
+                      "(SELECT id FROM conversations WHERE updated_at < ?)", (idle_before_ts,))
+            count = c.execute("DELETE FROM conversations WHERE updated_at < ?", (idle_before_ts,)).rowcount
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+        return count
+
+    def message_append(self, conversation_id: str, role: str, content: str, *,
+                       tool_name: str | None = None, tool_args: dict | None = None,
+                       tool_result: str | None = None, status: str = "complete",
+                       ts: float) -> MessageRow:
+        c = self._conn
+        c.execute("BEGIN")
+        try:
+            seq = int(c.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE conversation_id = ?",
+                                (conversation_id,)).fetchone()[0])
+            args_text = None if tool_args is None else json.dumps(tool_args)
+            row_id = c.execute(
+                "INSERT INTO messages (conversation_id, seq, role, content, tool_name, tool_args, "
+                "tool_result, status, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (conversation_id, seq, role, content, tool_name, args_text, tool_result, status, ts)).lastrowid
+            c.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (ts, conversation_id))
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+        return MessageRow(int(row_id), conversation_id, seq, role, content, tool_name, tool_args,
+                          tool_result, status, ts)
+
+    def messages_list(self, conversation_id: str, limit: int = 200) -> list[MessageRow]:
+        rows = self._conn.execute(
+            f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE conversation_id = ? "
+            "ORDER BY seq DESC LIMIT ?", (conversation_id, limit)).fetchall()
+        return [_row_to_message(r) for r in reversed(rows)]
+
+    def message_set_status(self, id: int, status: str) -> None:
+        self._conn.execute("UPDATE messages SET status = ? WHERE id = ?", (status, id))
+
 
 class AsyncStore:
     """A ``Store`` driven from asyncio.
@@ -594,8 +761,10 @@ class AsyncStore:
         return await self.run(self._store.queue_depths)
 
     async def list_events(self, *, type: str | None = None, status: str | None = None,
-                          limit: int = 100) -> list[StoredEvent]:
-        return await self.run(self._store.list_events, type=type, status=status, limit=limit)
+                          limit: int = 100, type_glob: str | None = None, source: str | None = None,
+                          since_ts: float | None = None, before_ts: float | None = None) -> list[StoredEvent]:
+        return await self.run(self._store.list_events, type=type, status=status, limit=limit,
+                              type_glob=type_glob, source=source, since_ts=since_ts, before_ts=before_ts)
 
     async def telemetry_insert(self, node_id: str, snapshot: dict, ts: float) -> None:
         await self.run(self._store.telemetry_insert, node_id, snapshot, ts)
@@ -667,3 +836,38 @@ class AsyncStore:
 
     async def audit_list(self, limit: int = 100, before_id: int | None = None) -> list[AuditRow]:
         return await self.run(self._store.audit_list, limit, before_id)
+
+    async def telemetry_latest_all(self) -> dict[str, dict]:
+        return await self.run(self._store.telemetry_latest_all)
+
+    async def conversation_create(self, id: str, title: str, ts: float) -> ConversationRow:
+        return await self.run(self._store.conversation_create, id, title, ts)
+
+    async def conversation_get(self, id: str) -> ConversationRow | None:
+        return await self.run(self._store.conversation_get, id)
+
+    async def conversations_list(self, limit: int = 50) -> list[ConversationRow]:
+        return await self.run(self._store.conversations_list, limit)
+
+    async def conversation_touch(self, id: str, ts: float, title: str | None = None) -> None:
+        await self.run(self._store.conversation_touch, id, ts, title)
+
+    async def conversation_delete(self, id: str) -> bool:
+        return await self.run(self._store.conversation_delete, id)
+
+    async def conversations_prune(self, idle_before_ts: float) -> int:
+        return await self.run(self._store.conversations_prune, idle_before_ts)
+
+    async def message_append(self, conversation_id: str, role: str, content: str, *,
+                             tool_name: str | None = None, tool_args: dict | None = None,
+                             tool_result: str | None = None, status: str = "complete",
+                             ts: float) -> MessageRow:
+        return await self.run(self._store.message_append, conversation_id, role, content,
+                              tool_name=tool_name, tool_args=tool_args, tool_result=tool_result,
+                              status=status, ts=ts)
+
+    async def messages_list(self, conversation_id: str, limit: int = 200) -> list[MessageRow]:
+        return await self.run(self._store.messages_list, conversation_id, limit)
+
+    async def message_set_status(self, id: int, status: str) -> None:
+        await self.run(self._store.message_set_status, id, status)
