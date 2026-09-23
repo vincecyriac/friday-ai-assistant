@@ -86,6 +86,9 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
         "  status TEXT NOT NULL DEFAULT 'complete', ts REAL NOT NULL)",
         "CREATE UNIQUE INDEX messages_conv_seq ON messages(conversation_id, seq)",
     ),
+    4: (
+        "ALTER TABLE messages ADD COLUMN via TEXT NOT NULL DEFAULT 'text'",
+    ),
 }
 
 _EVENT_COLUMNS = "id, ts, source, type, payload, priority, status, attempts, error, claimed_at, processed_at"
@@ -177,6 +180,7 @@ class MessageRow:
     tool_result: str | None
     status: str
     ts: float
+    via: str
 
 
 def _glob_to_like(glob: str) -> str:
@@ -197,7 +201,8 @@ _CONVERSATION_SELECT = (
     "SELECT c.id, c.title, c.created_at, c.updated_at, "
     "(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count "
     "FROM conversations c")
-_MESSAGE_COLUMNS = "id, conversation_id, seq, role, content, tool_name, tool_args, tool_result, status, ts"
+_MESSAGE_COLUMNS = ("id, conversation_id, seq, role, content, tool_name, tool_args, tool_result, "
+                    "status, ts, via")
 
 
 def _row_to_conversation(row: sqlite3.Row) -> ConversationRow:
@@ -208,7 +213,7 @@ def _row_to_conversation(row: sqlite3.Row) -> ConversationRow:
 def _row_to_message(row: sqlite3.Row) -> MessageRow:
     return MessageRow(row["id"], row["conversation_id"], row["seq"], row["role"], row["content"],
                       row["tool_name"], json.loads(row["tool_args"]) if row["tool_args"] else None,
-                      row["tool_result"], row["status"], row["ts"])
+                      row["tool_result"], row["status"], row["ts"], row["via"])
 
 
 def _row_to_stored(row: sqlite3.Row) -> StoredEvent:
@@ -651,7 +656,7 @@ class Store:
     def message_append(self, conversation_id: str, role: str, content: str, *,
                        tool_name: str | None = None, tool_args: dict | None = None,
                        tool_result: str | None = None, status: str = "complete",
-                       ts: float) -> MessageRow:
+                       via: str = "text", ts: float) -> MessageRow:
         c = self._conn
         c.execute("BEGIN")
         try:
@@ -660,15 +665,16 @@ class Store:
             args_text = None if tool_args is None else json.dumps(tool_args)
             row_id = c.execute(
                 "INSERT INTO messages (conversation_id, seq, role, content, tool_name, tool_args, "
-                "tool_result, status, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (conversation_id, seq, role, content, tool_name, args_text, tool_result, status, ts)).lastrowid
+                "tool_result, status, ts, via) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (conversation_id, seq, role, content, tool_name, args_text, tool_result, status,
+                 ts, via)).lastrowid
             c.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (ts, conversation_id))
             c.execute("COMMIT")
         except Exception:
             c.execute("ROLLBACK")
             raise
         return MessageRow(int(row_id), conversation_id, seq, role, content, tool_name, tool_args,
-                          tool_result, status, ts)
+                          tool_result, status, ts, via)
 
     def messages_list(self, conversation_id: str, limit: int = 200) -> list[MessageRow]:
         rows = self._conn.execute(
@@ -861,10 +867,10 @@ class AsyncStore:
     async def message_append(self, conversation_id: str, role: str, content: str, *,
                              tool_name: str | None = None, tool_args: dict | None = None,
                              tool_result: str | None = None, status: str = "complete",
-                             ts: float) -> MessageRow:
+                             via: str = "text", ts: float) -> MessageRow:
         return await self.run(self._store.message_append, conversation_id, role, content,
                               tool_name=tool_name, tool_args=tool_args, tool_result=tool_result,
-                              status=status, ts=ts)
+                              status=status, via=via, ts=ts)
 
     async def messages_list(self, conversation_id: str, limit: int = 200) -> list[MessageRow]:
         return await self.run(self._store.messages_list, conversation_id, limit)

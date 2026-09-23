@@ -83,7 +83,8 @@ async def test_real_dashboard_is_served(aiohttp_client, services):
     for path in ("/static/tailwind.css", "/static/app.js", "/static/api.js", "/static/socket.js",
                  "/static/ui.js", "/static/views/login.js", "/static/views/settings.js", "/static/views/tokens.js",
                  "/static/views/overview.js", "/static/views/activity.js", "/static/views/controls.js",
-                 "/static/md.js", "/static/views/assistant.js"):
+                 "/static/md.js", "/static/views/assistant.js",
+                 "/shared/orb.js", "/shared/three.module.min.js", "/static/views/voice.js"):
         assert (await client.get(path)).status == 200, path
     assert (await client.get("/", allow_redirects=False)).status == 302
 
@@ -139,3 +140,20 @@ for (const c of cases) process.stdout.write(render(c).serialize() + "\\n===\\n")
     assert 'href="javascript:' not in out[2] and "[bad](javascript:alert(1))" in out[2]   # literal text, no link
     assert out[3] == ""
     assert "**bold and `code" in out[4]
+
+
+def test_assistant_view_wires_voice_and_the_orb():
+    src = (DASHBOARD_DIR / "views" / "assistant.js").read_text()
+    assert 'import { createVoice } from "./voice.js"' in src
+    assert "orbStage" in src
+    html = HTML.read_text()
+    assert '"three": "./shared/three.module.min.js"' in html    # importmap for the orb
+
+
+def test_voice_module_uses_relative_urls_and_the_shared_orb():
+    src = (DASHBOARD_DIR / "views" / "voice.js").read_text()
+    assert "shared/orb.js" in src
+    assert "voice/ws" in src and not re.search(r'["\']/voice/ws', src)
+    assert "getUserMedia" in src and "24000" in src and "16000" in src
+    # the AudioContext must be created/resumed inside the click handler's call chain
+    assert "resume()" in src

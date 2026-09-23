@@ -51,7 +51,8 @@ version = {attr = "friday.__version__"}
 
 [tool.setuptools.package-data]
 "friday.desktop" = ["web_gui/**/*", "models/*"]
-"friday.sentinel" = ["dashboard/*"]
+"friday.sentinel" = ["dashboard/*", "dashboard/views/*"]
+"friday.webassets" = ["*.js"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

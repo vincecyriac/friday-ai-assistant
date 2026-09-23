@@ -75,6 +75,7 @@ async def test_message_stream_and_persistence(client, services):
     body = await (await client.get(f"/api/chat/{conv['id']}")).json()
     assert [m["role"] for m in body["messages"]] == ["user", "assistant", "tool", "assistant"]
     assert body["messages"][2]["tool_args"] == {} and body["messages"][-1]["id"] == lines[-1]["message_id"]
+    assert {m["via"] for m in body["messages"]} == {"text"}
     assert body["conversation"]["title"] == "status?" and body["conversation"]["message_count"] == 4
 
 

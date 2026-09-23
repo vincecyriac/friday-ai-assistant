@@ -113,6 +113,7 @@ FRIDAY is one installable package, `friday`, split into three sub-packages with 
 - **Handlers.** Each event is dispatched to every handler whose glob pattern matches its type (`node.*`, `telemetry.sample`, `*`). Delivery is at-least-once with three attempts, so handlers are idempotent upserts. Built-ins: heartbeat tracking, telemetry logging, and a log handler that marks where LLM triage plugs in.
 - **Telemetry.** CPU, load, memory, disk, uptime, thermal zones (psutil or raw sysfs) and power (battery, or Raspberry Pi `vcgencmd` under-voltage flags). Every probe degrades to `None` — a missing sensor never crashes a node.
 - **Bridges.** `FRIDAY_BRIDGES` names classes implementing `start(bus, ctx)` / `stop()`. A bridge publishes inbound events (an SMS → `message.received`) and subscribes to the `command.*` events it can act on. The Termux dialer, WhatsApp and cloud-voice bridges are this seam; none ship yet.
+- **Voice.** The sentinel runs its own Gemini Live session for the dashboard — same tools as the text assistant, transcripts persisted into the same thread. The engine is `friday.core.live`, shared with the desktop hub and (later) the call agent.
 - **Live intervals.** Telemetry/heartbeat cadence and retention are vault settings (`sentinel.*`); monitors read them each tick, so a change in the dashboard applies without a restart.
 - **Graceful lifecycle.** `SIGINT`/`SIGTERM` trigger an ordered shutdown: stop accepting, cancel monitors, stop bridges, drain in-flight handlers, checkpoint and close the store — bounded to 10 s. Every background task is supervised and restarted with backoff.
 
@@ -146,6 +147,17 @@ pruned after `sentinel.chat_retention_days`. The loop lives in `friday/sentinel/
 over `friday.core.llm`'s conversation API (`Message`, `Chunk`, `stream()`), which the triage
 handler and the call agent will reuse.
 
+### The Live engine
+
+`friday.core.live` owns every Gemini Live session in the project: connect, resume, rotate on
+`GoAway`, decode the stream into typed events (`AudioOut`, `TextOut`, `Transcript`,
+`Interrupted`, `TurnComplete`, `ToolStarted`/`ToolFinished`, `GoAway`), and answer tool calls —
+including the ones that raise, because an unanswered turn never closes and the model re-issues
+it after every resume. Consumers push media with `send_audio` / `send_video` / `send_text` and
+react to `session.events()`. An optional `AudioTransport` lets the session pump audio itself:
+the dashboard passes a WebSocket transport, the desktop hub passes none and keeps its own
+mic/playback multiplexing, and sub-project 6's call agent will pass an ALSA one.
+
 ### Sentinel API
 
 | Route | Auth | Purpose |
@@ -164,6 +176,7 @@ handler and the call agent will reuse.
 | `GET /api/telemetry` | node token or session | latest snapshot per node |
 | `GET/POST /api/chat`, `GET/DELETE /api/chat/{id}` | session | assistant conversations |
 | `POST /api/chat/{id}/messages` | session | one turn; `application/x-ndjson` stream of `delta` / `tool` / `result` / `error` / `done` |
+| `GET /voice/ws?conversation=<id>` | node token or session | Live voice: binary PCM both ways, JSON control frames |
 
 An event is a small JSON envelope; `type` is dotted lowercase and `payload` is free-form:
 
@@ -345,7 +358,7 @@ Unanticipated markup still lands sensibly: tables, lists, headings, paragraphs a
 .venv/bin/pytest
 ```
 
-`core` and `sentinel` are covered end to end: SQLite pragmas, crash recovery and the v1 → v2 migration, the event queue's claim/retry/park lifecycle, every telemetry probe with its sensor missing, the vault (wrong key, wrong setting key, tampered ciphertext), settings validation and vault → env → default precedence, scrypt/session/token/lockout logic, every dashboard route (CSRF header, Origin check, cookie flags, masked secrets, audit trail), the CLI, the desktop's config pull with cache and `.env` fallback, the daemon's full boot → `SIGTERM` → clean-exit path, the assistant loop against a scripted provider (tool round-trips, step cap, timeouts, prompt-injection, disconnects), NDJSON streaming through the aiohttp test client, and a dashboard build check that fails when `tailwind.css` is stale or a module does not parse. `tests/test_boundaries.py` imports every `core`/`sentinel` module in a subprocess where `Quartz`, `pyaudio`, `cv2`, `webview`, `EventKit`, `numpy` and friends are blocked — the guarantee that the sentinel really does run on a headless Linux box. Desktop modules get an import smoke that is skipped where the `desktop` extra is absent.
+`core` and `sentinel` are covered end to end: SQLite pragmas, crash recovery and the v1 → v2 migration, the event queue's claim/retry/park lifecycle, every telemetry probe with its sensor missing, the vault (wrong key, wrong setting key, tampered ciphertext), settings validation and vault → env → default precedence, scrypt/session/token/lockout logic, every dashboard route (CSRF header, Origin check, cookie flags, masked secrets, audit trail), the CLI, the desktop's config pull with cache and `.env` fallback, the daemon's full boot → `SIGTERM` → clean-exit path, the assistant loop against a scripted provider (tool round-trips, step cap, timeouts, prompt-injection, disconnects), NDJSON streaming through the aiohttp test client, a dashboard build check that fails when `tailwind.css` is stale or a module does not parse, the Live engine against a scripted fake client (turn loop, interruption, tool answers including a raising tool, `GoAway` rotation, resume-handle rules, backoff), and the voice bridge end to end (auth, frame routing, transcript persistence). `tests/test_boundaries.py` imports every `core`/`sentinel` module in a subprocess where `Quartz`, `pyaudio`, `cv2`, `webview`, `EventKit`, `numpy` and friends are blocked — the guarantee that the sentinel really does run on a headless Linux box. Desktop modules get an import smoke that is skipped where the `desktop` extra is absent.
 
 ## 💻 Tech Stack
 
@@ -353,7 +366,7 @@ Unanticipated markup still lands sensibly: tables, lists, headings, paragraphs a
 - **AI Models** — Google Gemini via `google-genai`: Live `3.1-flash-live-preview`, agents and widget generator `3.1-pro-preview` / `3.7-flash`
 - **macOS Native APIs** — PyObjC (Quartz CoreGraphics, EventKit, Foundation, WebKit), AppleScript
 - **Computer Vision & Biometrics** — OpenCV, ONNX (YuNet, SFace), NumPy, Pillow
-- **Frontend** — Vanilla JS + CSS, custom GLSL shaders, Three.js, MediaPipe HandLandmarker (WASM); sentinel dashboard in ES modules with Tailwind CSS 3.4 (standalone CLI at dev time; committed build)
+- **Frontend** — Vanilla JS + CSS, custom GLSL shaders, Three.js, MediaPipe HandLandmarker (WASM); sentinel dashboard in ES modules with Tailwind CSS 3.4 (standalone CLI at dev time; committed build); the FRIDAY orb (Three.js) is shared by both nodes
 - **Desktop Shell** — PyWebView (WKWebView) with a persistent data store
 - **Networking & Security** — Tailscale Serve HTTPS reverse proxy, zero-trust execution gateway
 
@@ -487,6 +500,7 @@ friday-ai-assistant/
 │   │   ├── events.py              # Event envelope, Heartbeat, TelemetrySnapshot schemas
 │   │   ├── telemetry.py           # sensor-tolerant collector
 │   │   ├── logsetup.py            # stdout logging, journald-aware
+│   │   ├── live/                  # Gemini Live: session, events, audio transports
 │   │   └── llm/                   # routing, provider protocol + conversation API (Message, Chunk, stream), Gemini adapter
 │   ├── desktop/                   # the macOS node
 │   │   ├── hub.py                 # Async hub: audio, WebSocket, Live session, widget deck
@@ -512,6 +526,7 @@ friday-ai-assistant/
 │       ├── api.py                 # aiohttp: /health /telemetry /nodes /events /ws
 │       ├── web.py                 # /auth/* /api/settings /api/tokens /api/audit /api/events /api/telemetry /api/chat /config + shell
 │       ├── audit.py               # audit row + audit.entry event
+│       ├── voice.py               # /voice/ws bridge: Live session ↔ browser audio
 │       ├── assistant.py           # tool set and streaming turn loop
 │       ├── services.py            # Services bundle handed to every handler
 │       ├── principals.py          # who is asking: session cookie (user) or bearer token (node)
@@ -519,9 +534,10 @@ friday-ai-assistant/
 │       ├── settings_registry.py   # declared shape of every dynamic setting
 │       ├── runtime_config.py      # vault → legacy .env → default; publishes config.changed
 │       ├── cli.py                 # friday-sentinel: run, keygen, user set-password, token create/list/revoke
-│       ├── dashboard/             # index.html, app.js, api.js, socket.js, ui.js, md.js, views/, tailwind.{src.css,config.js,css}
+│       ├── dashboard/             # index.html, app.js, api.js, socket.js, ui.js, md.js, views/ (incl. voice.js), tailwind.{src.css,config.js,css}
 │       ├── monitors.py            # telemetry sampler, self-heartbeat, housekeeping
 │       └── bridges/               # Bridge protocol + FRIDAY_BRIDGES loader
+│   └── webassets/                 # shared browser assets: orb.js + three.module.min.js (served at /shared)
 ├── tests/                         # pytest: core, sentinel, desktop import smoke, boundary guard
 ├── deploy/                        # systemd unit, launchd plist, setup_remote.sh, build_css.sh, README
 ├── docs/superpowers/              # design spec and implementation plan

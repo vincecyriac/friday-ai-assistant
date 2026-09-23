@@ -21,7 +21,7 @@
 
 import * as THREE from "three";
 
-const stage = document.getElementById("orb-stage");
+let stage = null;
 
 const STATE_COLORS = {
   idle:      "#00F2FE",
@@ -461,4 +461,14 @@ window.FridayOrb = {
   resize,
 };
 
-init();
+/** Mount the orb into `element`. Called by the sentinel dashboard; the desktop
+ *  HUD keeps its zero-argument auto-mount below. */
+export function mountOrb(element) {
+  if (!element) return null;
+  stage = element;
+  init();
+  return window.FridayOrb;
+}
+
+const autoStage = document.getElementById("orb-stage");
+if (autoStage) mountOrb(autoStage);

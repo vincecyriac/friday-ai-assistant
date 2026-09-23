@@ -216,7 +216,7 @@ def trim_history(messages: list[Message], budget: int = HISTORY_CHAR_BUDGET) -> 
     return [m for g in groups for m in g]
 
 
-def _title_from(text: str) -> str:
+def title_from(text: str) -> str:
     line = " ".join(text.split())
     return line[:TITLE_LIMIT] if line else DEFAULT_TITLE
 
@@ -246,7 +246,7 @@ async def run_turn(services, *, conversation_id: str, user: User, text: str, emi
     now = time.time()
     await store.message_append(conversation_id, "user", text, ts=now)
     if conv.title == DEFAULT_TITLE:
-        await store.conversation_touch(conversation_id, now, title=_title_from(text))
+        await store.conversation_touch(conversation_id, now, title=title_from(text))
 
     try:
         provider = services.provider_for("assistant")

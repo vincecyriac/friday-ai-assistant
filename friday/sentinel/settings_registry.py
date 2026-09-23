@@ -14,7 +14,7 @@ from typing import Any, Callable
 from friday.core.config import ConfigError
 from friday.core.llm.routing import parse_route
 
-GROUP_ORDER = ("llm", "desktop", "sentinel", "controls")
+GROUP_ORDER = ("llm", "desktop", "sentinel", "voice", "controls")
 
 
 class SettingValidationError(ValueError):
@@ -73,6 +73,11 @@ REGISTRY: tuple[SettingSpec, ...] = (
                 secret=True, scopes=("desktop",), env="TRIPO_API_KEY"),
     SettingSpec("desktop.voice", "str", "desktop", "Gemini Live voice for the desktop (Aoede or Kore)",
                 default="Aoede", scopes=("desktop",), env="FRIDAY_VOICE"),
+    SettingSpec("voice.enabled", "bool", "voice",
+                "Allow the dashboard to open a voice session with FRIDAY", default=True),
+    SettingSpec("voice.name", "enum", "voice",
+                "The sentinel's Gemini Live voice (the desktop has its own)",
+                default="Aoede", choices=("Aoede", "Kore", "Charon", "Fenrir", "Puck")),
     SettingSpec("controls.call_mode", "enum", "controls",
                 "When escalations may place a phone call",
                 default="urgent_only", choices=("always", "urgent_only", "mute")),

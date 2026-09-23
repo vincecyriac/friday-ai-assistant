@@ -1,6 +1,7 @@
 import { api, stream } from "../api.js";
 import { render } from "../md.js";
 import { cls, el, fmt, toast } from "../ui.js";
+import { createVoice } from "./voice.js";
 
 export const title = "Assistant";
 const RENDER_EVERY_MS = 80;
@@ -26,15 +27,22 @@ function toolAccordion(steps) {
   return el("div", { class: "mb-2" }, [toggle, body]);
 }
 
-function assistantBubble(content, steps, status) {
+function micGlyph(via, tone) {
+  return via === "voice" ? el("span", { class: cls("mr-2 text-xs", tone), text: "🎙" }) : null;
+}
+
+function assistantBubble(content, steps, status, via) {
   const body = el("div", { class: "prose-friday space-y-2" });
   body.append(render(content));
   return el("div", { class: "mr-auto max-w-[85%] rounded-xl border border-zinc-800 bg-zinc-900 px-4 py-3" }, [
-    toolAccordion(steps), body, statusTag(status)]);
+    toolAccordion(steps), micGlyph(via, "text-zinc-500"), body, statusTag(status)]);
 }
 
-function userBubble(content) {
-  return el("div", { class: "ml-auto max-w-[85%] whitespace-pre-wrap rounded-xl border border-indigo-500/40 bg-indigo-500/10 px-4 py-3", text: content });
+function userBubble(content, via) {
+  const bubble = el("div", { class: "ml-auto max-w-[85%] whitespace-pre-wrap rounded-xl border border-indigo-500/40 bg-indigo-500/10 px-4 py-3", text: content });
+  const glyph = micGlyph(via, "text-indigo-300");
+  if (glyph) bubble.prepend(glyph);
+  return bubble;
 }
 
 function systemRow(message) {
@@ -50,6 +58,30 @@ export async function mount(root, ctx) {
     onkeydown: (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); } } });
   const sendButton = el("button", { class: "btn btn-primary", text: "Send", onclick: () => send() });
   const stopButton = el("button", { class: "btn btn-ghost hidden", text: "Stop", onclick: () => state.controller && state.controller.abort() });
+  const orbStage = el("div", { class: "h-40 w-full" });
+  const caption = el("div", { class: "min-h-[1.25rem] text-center text-xs text-zinc-400" });
+  const voice = createVoice({
+    orbStage,
+    conversationId: () => state.currentId,
+    onTranscript: (msg) => { caption.textContent = msg.final ? "" : msg.text; },
+    onTool: (msg) => { if (msg.phase === "done") toast(`${msg.name} · ${msg.ms} ms`); },
+    onTurnComplete: async () => {
+      caption.textContent = "";
+      try { await select(state.currentId); } catch (e) { /* signed out or deleted */ }
+    },
+  });
+  const micButton = el("button", {
+    class: "btn", text: "Voice",
+    onclick: async () => {
+      await voice.toggle();
+      micButton.className = cls("btn", voice.active && "btn-primary");
+      micButton.textContent = voice.active ? "Stop voice" : "Voice";
+    },
+  });
+  if (!voice.supported) {
+    micButton.disabled = true;
+    micButton.title = "This browser cannot capture audio";
+  }
   const newButton = el("button", { class: "btn w-full justify-center", text: "New chat", onclick: async () => {
     const conv = await api("api/chat", { method: "POST", json: {} });
     await loadList();
@@ -79,9 +111,9 @@ export async function mount(root, ctx) {
     thread.replaceChildren();
     let steps = [];
     messages.forEach((m) => {
-      if (m.role === "user") { thread.append(userBubble(m.content)); return; }
+      if (m.role === "user") { thread.append(userBubble(m.content, m.via)); return; }
       if (m.role === "tool") { steps.push({ name: m.tool_name, args: m.tool_args, output: m.tool_result }); return; }
-      thread.append(assistantBubble(m.content, steps, m.status));
+      thread.append(assistantBubble(m.content, steps, m.status, m.via));
       steps = [];
     });
     if (steps.length) thread.append(assistantBubble("", steps, "complete"));
@@ -167,13 +199,18 @@ export async function mount(root, ctx) {
     el("aside", { class: "hidden w-64 shrink-0 flex-col gap-3 md:flex" }, [newButton, el("div", { class: "min-h-0 flex-1 overflow-y-auto" }, [list])]),
     el("div", { class: "flex min-w-0 flex-1 flex-col gap-3" }, [
       el("div", { class: "flex gap-2 md:hidden" }, [picker, el("button", { class: "btn", text: "New", onclick: () => newButton.click() })]),
+      orbStage,
+      caption,
       el("section", { class: "card flex min-h-0 flex-1 flex-col" }, [thread]),
-      el("div", { class: "flex items-end gap-2" }, [input, stopButton, sendButton]),
+      el("div", { class: "flex items-end gap-2" }, [input, micButton, stopButton, sendButton]),
     ]),
   ]));
 
   await loadList();
   if (state.conversations.length) await select(state.conversations[0].id);
   else thread.append(systemRow("Start a new chat."));
-  return { unmount: () => state.controller && state.controller.abort(), refresh: loadList };
+  return {
+    unmount: () => { voice.stop(); if (state.controller) state.controller.abort(); },
+    refresh: loadList,
+  };
 }

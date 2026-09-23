@@ -259,7 +259,7 @@ async def test_unknown_conversation_raises(services):
 
 def _row(seq, role, content="", **kw):
     return MessageRow(seq, "c", seq, role, content, kw.get("tool_name"), kw.get("tool_args"),
-                      kw.get("tool_result"), "complete", float(seq))
+                      kw.get("tool_result"), "complete", float(seq), kw.get("via", "text"))
 
 
 def test_to_messages_derives_tool_calls_from_following_tool_rows():

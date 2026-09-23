@@ -66,7 +66,7 @@ def test_generic_types():
 
 def test_schema_has_groups_and_no_values():
     groups = schema()
-    assert [g["name"] for g in groups] == ["llm", "desktop", "sentinel", "controls"]
+    assert [g["name"] for g in groups] == ["llm", "desktop", "sentinel", "voice", "controls"]
     flat = json.dumps(groups)
     assert "value" not in flat
     key = next(k for g in groups for k in g["keys"] if k["key"] == "controls.call_mode")
@@ -76,7 +76,7 @@ def test_schema_has_groups_and_no_values():
 
 def test_sentinel_and_monitor_keys():
     from friday.sentinel.settings_registry import GROUP_ORDER
-    assert GROUP_ORDER == ("llm", "desktop", "sentinel", "controls")
+    assert GROUP_ORDER == ("llm", "desktop", "sentinel", "voice", "controls")
     assert spec_for("sentinel.telemetry_interval_s").env == "FRIDAY_TELEMETRY_INTERVAL"
     assert spec_for("sentinel.telemetry_interval_s").default == 15.0
     assert spec_for("sentinel.heartbeat_interval_s").default == 30.0
@@ -86,7 +86,7 @@ def test_sentinel_and_monitor_keys():
         assert spec_for(f"controls.monitors.{name}").type == "bool" and spec_for(f"controls.monitors.{name}").default is False
     assert spec_for("llm.routes.assistant").default == "gemini:gemini-3.7-flash"
     assert spec_for("llm.routes.assistant").scopes == () and spec_for("llm.routes.assistant").env == "FRIDAY_LLM_ASSISTANT"
-    assert [g["name"] for g in schema()] == ["llm", "desktop", "sentinel", "controls"]
+    assert [g["name"] for g in schema()] == ["llm", "desktop", "sentinel", "voice", "controls"]
 
 
 @pytest.mark.parametrize("key,raw,expected", [
@@ -108,3 +108,15 @@ def test_new_keys_reject_out_of_range(key, raw):
     with pytest.raises(SettingValidationError) as excinfo:
         validate(spec_for(key), raw)
     assert "between" in str(excinfo.value)
+
+
+def test_voice_keys():
+    from friday.sentinel.settings_registry import GROUP_ORDER
+    assert GROUP_ORDER == ("llm", "desktop", "sentinel", "voice", "controls")
+    assert spec_for("voice.enabled").type == "bool" and spec_for("voice.enabled").default is True
+    assert spec_for("voice.name").default == "Aoede"
+    assert spec_for("voice.name").choices == ("Aoede", "Kore", "Charon", "Fenrir", "Puck")
+    assert validate(spec_for("voice.name"), "Kore") == "Kore"
+    with pytest.raises(SettingValidationError):
+        validate(spec_for("voice.name"), "Siri")
+    assert [g["name"] for g in schema()] == ["llm", "desktop", "sentinel", "voice", "controls"]

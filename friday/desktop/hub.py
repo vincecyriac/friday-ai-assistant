@@ -31,6 +31,8 @@ import friday
 from friday.core.config import get_settings, override_settings
 from friday.core.events import Event, Heartbeat
 from friday.core.llm import gemini_client, resolve
+from friday.core.live import (AudioOut, Connected, Disconnected, GoAway, Interrupted, LiveConfig,
+                              LiveSession, TextOut, ToolFinished, ToolStarted, TurnComplete)
 from friday.core.platform import detect
 from friday.core.telemetry import collect
 from friday.desktop import config_pull
@@ -330,10 +332,7 @@ async def notify_session_remote_change(connected: bool):
         note = ("[System note, do not respond: the remote phone session ended. Vince is back at "
                 "the Mac; its webcam and screen are the primary senses again.]")
     try:
-        await global_live_session.send_client_content(
-            turns=[{"role": "user", "parts": [{"text": note}]}],
-            turn_complete=False
-        )
+        await global_live_session.send_text(note, turn_complete=False)
     except Exception:
         pass
 
@@ -403,9 +402,7 @@ async def ws_handler(websocket):
                         latest_remote_frame_ts = time.time()
                         if camera_stream_active and camera_source["mode"] != "mac" \
                                 and global_live_session:
-                            await global_live_session.send_realtime_input(
-                                video=types.Blob(data=latest_remote_frame_bytes, mime_type="image/jpeg")
-                            )
+                            await global_live_session.send_video(latest_remote_frame_bytes)
                 elif msg_type == "exec_approval_response":
                     fut = pending_exec_approvals.get(data.get("id"))
                     if fut and not fut.done():
@@ -418,17 +415,12 @@ async def ws_handler(websocket):
                         if len(mic_audio_buffer) > MAX_BUFFER_SIZE:
                             mic_audio_buffer = mic_audio_buffer[-MAX_BUFFER_SIZE:]
                         if global_live_session:
-                            await global_live_session.send_realtime_input(
-                                audio=types.Blob(data=pcm_bytes, mime_type="audio/pcm;rate=16000")
-                            )
+                            await global_live_session.send_audio(pcm_bytes)
                 elif msg_type == "user_text":
                     text = data.get("text")
                     if text and global_live_session:
                         log_info(f"GUI Chat: {text[:40]}...")
-                        await global_live_session.send_client_content(
-                            turns=[{"role": "user", "parts": [{"text": text}]}],
-                            turn_complete=True
-                        )
+                        await global_live_session.send_text(text)
                 elif msg_type == "sve_user_action":
                     sentry_scene.manager.user_action(
                         data.get("scene_id"), data.get("action"),
@@ -442,12 +434,10 @@ async def ws_handler(websocket):
                         if note and note != last_focus_note and global_live_session:
                             last_focus_note = note
                             try:
-                                await global_live_session.send_client_content(
-                                    turns=[{"role": "user", "parts": [{"text":
-                                        f"[UI context, not a question — do not respond yet: Vince is now pointing at {note}. "
-                                        "If his next question says 'this' or 'it', he means that object.]"}]}],
-                                    turn_complete=False
-                                )
+                                await global_live_session.send_text(
+                                    f"[UI context, not a question — do not respond yet: Vince is now pointing at {note}. "
+                                    "If his next question says 'this' or 'it', he means that object.]",
+                                    turn_complete=False)
                             except Exception:
                                 pass
                 elif msg_type == "widget_user_action":
@@ -585,10 +575,12 @@ async def play_audio_worker(output_stream):
             log_info(f"Playback error: {e}")
             await asyncio.sleep(0.1)
 
-async def send_audio_task(session, input_stream, session_disconnect_event):
-    global mic_audio_buffer, model_is_speaking
+async def mic_pump_task(session, input_stream):
+    """Mac microphone → Live session, for the whole run (the session survives
+    rotations now, so this is no longer per-connection)."""
+    global mic_audio_buffer
     loop = asyncio.get_running_loop()
-    while not shutdown_event.is_set() and not session_disconnect_event.is_set():
+    while not shutdown_event.is_set():
         try:
             data = await loop.run_in_executor(
                 None,
@@ -598,40 +590,33 @@ async def send_audio_task(session, input_stream, session_disconnect_event):
                 mic_audio_buffer.extend(data)
                 if len(mic_audio_buffer) > MAX_BUFFER_SIZE:
                     mic_audio_buffer = mic_audio_buffer[-MAX_BUFFER_SIZE:]
-                
+
                 # Only send PyAudio mic data to Gemini if NO WebSocket GUI client is connected
                 if not model_is_speaking and not connected_ws_clients:
-                    await session.send_realtime_input(
-                        audio=types.Blob(
-                            data=data,
-                            mime_type="audio/pcm;rate=16000"
-                        )
-                    )
+                    await session.send_audio(data)
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            if not session_disconnect_event.is_set() and not shutdown_event.is_set():
+            if not shutdown_event.is_set():
                 log_info(f"Error reading mic: {e}")
             await asyncio.sleep(0.1)
 
-async def stream_senses_task(session, session_disconnect_event):
+async def stream_senses_task(session):
     """Continuously captures and streams the user's screen and webcam frames to the Live session in the background when enabled by the AI."""
     global active_webcam, latest_webcam_frame_bytes
     webcam = sentry_vision.PersistentWebcam()
     active_webcam = webcam
     loop = asyncio.get_running_loop()
     try:
-        while not shutdown_event.is_set() and not session_disconnect_event.is_set():
+        while not shutdown_event.is_set():
             try:
                 if screen_stream_active:
                     screen_bytes = await loop.run_in_executor(None, sentry_vision.capture_screen, "active")
                     if screen_bytes:
                         b64 = base64.b64encode(screen_bytes).decode('utf-8')
                         broadcast_event({"type": "screen_frame", "image_base64": b64})
-                        await session.send_realtime_input(
-                            video=types.Blob(data=screen_bytes, mime_type="image/jpeg")
-                        )
+                        await session.send_video(screen_bytes)
                     await asyncio.sleep(0.8)
                 
                 if camera_stream_active:
@@ -648,9 +633,7 @@ async def stream_senses_task(session, session_disconnect_event):
                             latest_webcam_frame_bytes = webcam_bytes
                             b64 = base64.b64encode(webcam_bytes).decode('utf-8')
                             broadcast_event({"type": "camera_frame", "image_base64": b64})
-                            await session.send_realtime_input(
-                                video=types.Blob(data=webcam_bytes, mime_type="image/jpeg")
-                            )
+                            await session.send_video(webcam_bytes)
                         await asyncio.sleep(0.8)
                 else:
                     webcam.stop()
@@ -661,7 +644,7 @@ async def stream_senses_task(session, session_disconnect_event):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                if not session_disconnect_event.is_set() and not shutdown_event.is_set():
+                if not shutdown_event.is_set():
                     log_interaction("sense_stream_error", {"error": str(e)})
                 await asyncio.sleep(2.0)
     finally:
@@ -1172,12 +1155,9 @@ async def agent_result_dispatcher():
         label, outcome = pending_agent_results.pop(0)
         quiet_for = 0.0
         try:
-            await global_live_session.send_client_content(
-                turns=[{"role": "user", "parts": [{"text":
-                    f"[Background {label} agent finished. Tell Vince this result now, in one short "
-                    f"spoken sentence, without mentioning agents or tools: {outcome}]"}]}],
-                turn_complete=True,
-            )
+            await global_live_session.send_text(
+                f"[Background {label} agent finished. Tell Vince this result now, in one short "
+                f"spoken sentence, without mentioning agents or tools: {outcome}]")
         except Exception as e:
             log_info(f"Could not deliver agent result to the live session: {e}")
 
@@ -1939,121 +1919,74 @@ TOOL_FUNCTION_DECLARATIONS = [
                     }
 ]
 
-async def receive_audio_task(session, session_disconnect_event):
-    global camera_stream_active, screen_stream_active, model_is_speaking, model_turn_active
-    try:
-        # session.receive() yields ONE conversational turn and then ends. Without
-        # this outer loop the task falls through after the first reply, the session
-        # is torn down, and the reconnect resumes a handle whose last turn is replayed
-        # — which re-fires that turn's tool calls on every rotation.
-        while not (shutdown_event.is_set() or session_disconnect_event.is_set()):
-            async for message in session.receive():
-                if shutdown_event.is_set() or session_disconnect_event.is_set():
-                    break
-                try:
-                    # 0. Handle GoAway Signal (proactive session rotation before 1008 timeout)
-                    if message.go_away:
-                        time_left = getattr(message.go_away, "time_left", None)
-                        log_info(f"Received GoAway from Gemini API (time left: {time_left}). Gracefully closing to rotate/resume session...")
-                        session_disconnect_event.set()
-                        return
+async def live_event_task(session):
+    """Everything the Live session reports, turned into the GUI's reality:
+    playback, chat log, status, interruption, tool activity."""
+    global model_is_speaking, model_turn_active
+    async for event in session.events():
+        try:
+            if isinstance(event, AudioOut):
+                set_system_status("Speaking")
+                model_turn_active = True
+                await play_queue.put(event.pcm)
+                broadcast_event({"type": "audio_out",
+                                 "pcm_base64": base64.b64encode(event.pcm).decode("utf-8")})
 
-                    # 1. Interruption (Barge-In)
-                    if message.server_content and message.server_content.interrupted:
-                        set_system_status("Listening (Interrupted)")
-                        interrupted_event.set()
-                        model_is_speaking = False
-                        while not play_queue.empty():
-                            try:
-                                play_queue.get_nowait()
-                                play_queue.task_done()
-                            except asyncio.QueueEmpty:
-                                break
-                        await asyncio.sleep(0.05)
-                        interrupted_event.clear()
-                        model_turn_active = False
-                        broadcast_event({"type": "interrupted"})
-                        log_interaction("user_interruption", {})
-                        continue
+            elif isinstance(event, TextOut):
+                broadcast_event({"type": "chat_log", "sender": "FRIDAY",
+                                 "text": event.text, "style": "friday"})
 
-                    # 2. Audio Output
-                    if message.server_content and message.server_content.model_turn:
-                        for part in message.server_content.model_turn.parts:
-                            if part.inline_data:
-                                set_system_status("Speaking")
-                                model_turn_active = True
-                                audio_data = part.inline_data.data
-                                await play_queue.put(audio_data)
-                                pcm_b64 = base64.b64encode(audio_data).decode('utf-8')
-                                broadcast_event({"type": "audio_out", "pcm_base64": pcm_b64})
-                            if part.text:
-                                broadcast_event({"type": "chat_log", "sender": "FRIDAY", "text": part.text, "style": "friday"})
+            elif isinstance(event, Interrupted):
+                set_system_status("Listening (Interrupted)")
+                interrupted_event.set()
+                model_is_speaking = False
+                while not play_queue.empty():
+                    try:
+                        play_queue.get_nowait()
+                        play_queue.task_done()
+                    except asyncio.QueueEmpty:
+                        break
+                await asyncio.sleep(0.05)
+                interrupted_event.clear()
+                model_turn_active = False
+                broadcast_event({"type": "interrupted"})
+                log_interaction("user_interruption", {})
 
-                    # Reset status to Listening when turn finishes
-                    if message.server_content and message.server_content.turn_complete:
-                        model_turn_active = False
-                        set_system_status("Listening")
+            elif isinstance(event, TurnComplete):
+                model_turn_active = False
+                set_system_status("Listening")
 
-                    # 3. Handle Session Resumption (Silent log)
-                    if message.session_resumption_update:
-                        update = message.session_resumption_update
-                        if update.resumable and update.new_handle:
-                            save_session_handle(update.new_handle)
+            elif isinstance(event, ToolStarted):
+                set_system_status(f"Executing {event.name}")
+                log_info(f"Tool call: {event.name}")
+                broadcast_event({"type": "tool_activity", "phase": "start", "name": event.name,
+                                 "args_preview": json.dumps(event.args)[:220]})
+                log_interaction("tool_call_received", {"name": event.name, "args": event.args})
 
-                    # 4. Handle OS Execution Tool Calls
-                    if message.tool_call:
-                        function_responses = []
-                        for fc in message.tool_call.function_calls:
-                            set_system_status(f"Executing {fc.name}")
-                            log_info(f"Tool call: {fc.name}")
-                            broadcast_event({
-                                "type": "tool_activity",
-                                "phase": "start",
-                                "name": fc.name,
-                                "args_preview": json.dumps(dict(fc.args or {}))[:220]
-                            })
-                            log_interaction("tool_call_received", {"name": fc.name, "args": fc.args})
+            elif isinstance(event, ToolFinished):
+                log_info(f"Result: {event.output[:50]}...")
+                broadcast_event({"type": "tool_activity", "phase": "done", "name": event.name,
+                                 "result_preview": event.output[:300]})
+                log_interaction("tool_call_executed",
+                                {"name": event.name, "output_preview": event.output[:100]})
 
-                            # A raising tool must still produce a response. Skipping
-                            # send_tool_response leaves the turn open forever, and the
-                            # model re-issues the same calls on every later resume.
-                            try:
-                                result, tool_image = await execute_tool(fc.name, dict(fc.args or {}))
-                                if tool_image:
-                                    await session.send_realtime_input(
-                                        video=types.Blob(data=tool_image, mime_type="image/jpeg")
-                                    )
-                            except Exception as tool_err:
-                                result = f"[Tool error] {fc.name} failed: {tool_err}"
-                                log_info(result)
-                                log_interaction("tool_call_failed", {"name": fc.name, "error": str(tool_err)})
+            elif isinstance(event, Connected):
+                set_system_status("Listening")
+                log_interaction("connection_success", {"resumed": event.resumed})
 
-                            log_info(f"Result: {str(result)[:50]}...")
-                            broadcast_event({
-                                "type": "tool_activity",
-                                "phase": "done",
-                                "name": fc.name,
-                                "result_preview": str(result)[:300]
-                            })
-                            log_interaction("tool_call_executed", {"name": fc.name, "output_preview": str(result)[:100]})
-                        
-                            function_responses.append(types.FunctionResponse(
-                                id=fc.id,
-                                name=fc.name,
-                                response={"output": result}
-                            ))
-                    
-                        if function_responses:
-                            await session.send_tool_response(function_responses=function_responses)
+            elif isinstance(event, Disconnected):
+                if event.will_retry:
+                    set_system_status("Connection Failed")
+                log_info(f"Live session ended: {event.reason}")
+                log_interaction("connection_error", {"error": event.reason})
 
-                except Exception as e:
-                    log_info(f"Error in receive message: {e}")
-            
-    except Exception as e:
-        if not shutdown_event.is_set():
-            log_info(f"Receive stream error / ended: {e}")
-    finally:
-        session_disconnect_event.set()
+            elif isinstance(event, GoAway):
+                log_info(f"Received GoAway from Gemini API (time left: {event.time_left}). Rotating...")
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_info(f"Error handling live event: {e}")
 
 
 IMAGE_MAX_BYTES = 6 * 1024 * 1024
@@ -2210,6 +2143,9 @@ async def start_gui_server():
     # Saved .glb files, served same-origin so the loader can read them.
     os.makedirs(ASSETS_DIR, exist_ok=True)
     app.router.add_static("/assets", path=ASSETS_DIR)
+    # Shared with the sentinel dashboard: the orb and its Three.js runtime.
+    from friday.webassets import WEBASSETS_DIR
+    app.router.add_static("/shared", path=str(WEBASSETS_DIR))
     app.router.add_static("/", path=gui_dir)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -2217,33 +2153,6 @@ async def start_gui_server():
     await site.start()
     log_info("GUI server listening on http://127.0.0.1:8766")
     return runner
-
-async def run_session_tasks(session, input_stream):
-    global global_live_session
-    global_live_session = session
-    session_disconnect_event = asyncio.Event()
-
-    audio_in_task = asyncio.create_task(send_audio_task(session, input_stream, session_disconnect_event))
-    audio_out_task = asyncio.create_task(receive_audio_task(session, session_disconnect_event))
-    senses_task = asyncio.create_task(stream_senses_task(session, session_disconnect_event))
-
-    shutdown_waiter = asyncio.create_task(shutdown_event.wait())
-    disconnect_waiter = asyncio.create_task(session_disconnect_event.wait())
-
-    try:
-        done, pending = await asyncio.wait(
-            [shutdown_waiter, disconnect_waiter],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        for p in pending:
-            p.cancel()
-    finally:
-        session_disconnect_event.set()
-        audio_in_task.cancel()
-        audio_out_task.cancel()
-        senses_task.cancel()
-        await asyncio.gather(audio_in_task, audio_out_task, senses_task, return_exceptions=True)
-        global_live_session = None
 
 def build_system_instruction(memory_str: str) -> str:
     return (
@@ -2426,79 +2335,43 @@ async def run_friday():
     system_instruction_text = build_system_instruction(memory_str)
     system_prompt_text = system_instruction_text
 
-    consecutive_failures = 0
     # New process, new conversation: the handle starts empty and is only
     # populated by this run's own session, for rotations within it.
     clear_session_handle()
 
+    global global_live_session
+    live_session = LiveSession(
+        client,
+        LiveConfig(model=MODEL_ID, voice=LIVE_VOICE,
+                   system_instruction=system_instruction_text,
+                   tools=tuple(TOOL_FUNCTION_DECLARATIONS), google_search=True,
+                   resume_handle=current_session_handle),
+        tool_handler=execute_tool,
+        on_handle=save_session_handle,
+    )
+    global_live_session = live_session
+    set_system_status("Connecting to API")
+    log_interaction("connection_attempt", {"model": MODEL_ID, "resuming": False})
+
+    mic_task = asyncio.create_task(mic_pump_task(live_session, input_stream))
+    senses_task = asyncio.create_task(stream_senses_task(live_session))
+    events_task = asyncio.create_task(live_event_task(live_session))
+    stop_waiter = asyncio.create_task(shutdown_event.wait())
+
     try:
-        while not shutdown_event.is_set():
-            previous_handle = current_session_handle
-
-            live_config = types.LiveConnectConfig(
-                response_modalities=[types.Modality.AUDIO],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                            voice_name=LIVE_VOICE
-                        )
-                    )
-                ),
-                system_instruction=types.Content(
-                    parts=[types.Part.from_text(text=system_instruction_text)]
-                ),
-                tools=[
-                    types.Tool(google_search=types.GoogleSearch()),
-                    types.Tool(function_declarations=TOOL_FUNCTION_DECLARATIONS),
-                ],
-                # No "transparent": that flag is Vertex / Agent Platform only, and
-                # the Developer API refuses the whole connection when it is set.
-                # Sent on every connect (handle=None just starts a fresh
-                # resumable session) to match the documented contract that this
-                # config is what asks the server for SessionResumptionUpdates.
-                session_resumption=types.SessionResumptionConfig(handle=previous_handle),
-            )
-
-            if previous_handle:
-                log_info("Resuming previous session handle...")
-
-            set_system_status("Connecting to API" if not previous_handle else "Resuming API Session")
-            log_interaction("connection_attempt", {"model": MODEL_ID, "resuming": previous_handle is not None})
-            
-            session_established = False
-            try:
-                async with client.aio.live.connect(model=MODEL_ID, config=live_config) as session:
-                    session_established = True
-                    set_system_status("Listening")
-                    log_interaction("connection_success", {"resumed": previous_handle is not None})
-                    consecutive_failures = 0
-
-                    await run_session_tasks(session, input_stream)
-
-            except Exception as e:
-                consecutive_failures += 1
-                log_interaction("connection_error", {"error": str(e), "established": session_established})
-                if previous_handle and not session_established:
-                    # The handshake itself was refused while resuming, so the
-                    # handle is stale/invalid — drop it and reconnect clean.
-                    log_info(f"Session resumption failed ({e}). Clearing handle and starting fresh...")
-                    clear_session_handle()
-                    await sleep_unless_shutdown(0.5)
-                else:
-                    # Either a cold-start failure or a live session that dropped.
-                    # A live session's handle is exactly what we need to resume
-                    # the rotation, so it is deliberately kept.
-                    set_system_status("Connection Failed")
-                    log_info(f"Live API error: {e}")
-                    backoff = min(10, 2 ** min(consecutive_failures, 3))
-                    log_info(f"Retrying connection in {backoff}s...")
-                    await sleep_unless_shutdown(backoff)
-
-            if not shutdown_event.is_set():
-                log_info("Gemini Live session ended. Rotating / resuming session...")
-                await sleep_unless_shutdown(0.2)
-
+        session_runner = asyncio.create_task(live_session.run())
+        await asyncio.wait([session_runner, stop_waiter], return_when=asyncio.FIRST_COMPLETED)
+        live_session.stop()
+        await asyncio.wait_for(session_runner, timeout=5)
+    except asyncio.TimeoutError:
+        log_info("Live session did not stop in time; continuing shutdown.")
     finally:
+        live_session.stop()
+        global_live_session = None
+        for task in (mic_task, senses_task, events_task, stop_waiter):
+            task.cancel()
+        await asyncio.gather(mic_task, senses_task, events_task, stop_waiter, return_exceptions=True)
+
         set_system_status("Shutting Down")
 
         # 1. Stop everything that could still touch an audio device, and WAIT

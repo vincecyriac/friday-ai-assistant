@@ -32,6 +32,16 @@ mode, do-not-disturb, monitor switches and the sentinel's intervals (live, no
 restart); Assistant is a text chat with FRIDAY that can read the same data and flip
 the controls. Settings and Nodes & tokens are unchanged.
 
+The Assistant page also talks. **Voice** opens a Gemini Live session on the sentinel over
+`/voice/ws` (binary PCM: 16 kHz up, 24 kHz down) with the same seven tools the text chat has, so
+"mute calls" works by voice and lands in the audit trail. The session is explicit — it starts
+when you click and ends when you click again, navigate away or close the tab. Turn it off
+entirely with `voice.enabled` under **Settings → voice**; pick the server's voice with
+`voice.name` (the Mac HUD keeps its own, `desktop.voice`).
+
+The orb and its Three.js runtime are shared between both nodes: they live in
+`friday/webassets/` and are served at `/shared` by the sentinel and by the desktop hub.
+
 The dashboard is static files under `friday/sentinel/dashboard/`; `tailwind.css`
 is committed. After editing any class in the HTML/JS run `deploy/build_css.sh`
 (downloads the Tailwind 3.4.17 standalone binary into `.cache/` once; no Node
@@ -75,8 +85,8 @@ FRIDAY_SENTINEL_URL=https://<host>.<tailnet>.ts.net/sentinel
 FRIDAY_SENTINEL_TOKEN=<token from "friday-sentinel token create desktop">
 ```
 
-The dashboard's WebSocket (`/ws`) also goes through the proxy; Tailscale Serve
-passes it as-is.
+The dashboard's WebSockets (`/ws` and `/voice/ws`) also go through the proxy;
+Tailscale Serve passes them as-is.
 
 `setup_remote.sh` in this directory is the existing script for exposing the
 **desktop hub** the same way; it is unchanged.
@@ -99,6 +109,7 @@ passes it as-is.
 | `GET /api/telemetry` | node token or session | latest snapshot per node |
 | `GET/POST /api/chat`, `GET/DELETE /api/chat/{id}` | session | assistant conversations |
 | `POST /api/chat/{id}/messages` | session | one turn; `application/x-ndjson` stream of `delta` / `tool` / `result` / `error` / `done` |
+| `GET /voice/ws?conversation=<id>` | node token or session | Live voice: binary PCM both ways, JSON control frames |
 
 Node tokens go in `Authorization: Bearer fn_…`. State-changing dashboard
 calls (`POST`/`PUT`/`DELETE`) must also send `X-FRIDAY-Client: dashboard`.

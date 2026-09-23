@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import secrets
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from aiohttp import web
+from aiohttp import WSMsgType, web
 
 from friday.sentinel.assistant import DEFAULT_TITLE, run_turn
 from friday.sentinel.auth import (SESSION_COOKIE, Node, User, client_ip, hash_password, is_https,
@@ -24,6 +25,10 @@ from friday.sentinel.auth import (SESSION_COOKIE, Node, User, client_ip, hash_pa
 from friday.sentinel.principals import require_principal, require_user, resolve_principal
 from friday.sentinel.services import SERVICES
 from friday.sentinel.settings_registry import SettingValidationError, schema, spec_for
+from friday.sentinel.voice import VoiceSession
+from friday.webassets import WEBASSETS_DIR
+
+log = logging.getLogger(__name__)
 
 CLIENT_HEADER = "X-FRIDAY-Client"
 DASHBOARD_DIR = Path(__file__).parent / "dashboard"
@@ -269,7 +274,7 @@ def _conversation_dict(row) -> dict:
 def _message_dict(row) -> dict:
     return {"id": row.id, "seq": row.seq, "role": row.role, "content": row.content,
             "tool_name": row.tool_name, "tool_args": row.tool_args, "tool_result": row.tool_result,
-            "status": row.status, "ts": row.ts}
+            "status": row.status, "ts": row.ts, "via": row.via}
 
 
 async def chat_list(request: web.Request) -> web.Response:
@@ -352,6 +357,53 @@ async def chat_message(request: web.Request) -> web.StreamResponse:
         return resp
 
 
+# ----------------------------------------------------------------- voice
+
+async def voice_ws(request: web.Request) -> web.StreamResponse:
+    principal = await require_principal(request)
+    svc = request.app[SERVICES]
+    if not svc.config.get("voice.enabled"):
+        return _error(503, "voice is disabled")
+
+    conv_id = request.query.get("conversation") or ""
+    if not conv_id or await svc.store.conversation_get(conv_id) is None:
+        row = await svc.store.conversation_create(secrets.token_hex(8), DEFAULT_TITLE, time.time())
+        conv_id = row.id
+    if conv_id in svc.voice_sessions:
+        return _error(409, "a voice session is already open for this conversation")
+
+    user = principal if isinstance(principal, User) else User(f"node:{principal.name}")
+    ws = web.WebSocketResponse(heartbeat=20.0, max_msg_size=4 * 1024 * 1024)
+    await ws.prepare(request)
+    await ws.send_json({"type": "state", "value": "connecting", "conversation_id": conv_id})
+
+    session = VoiceSession(svc, user, conv_id, ws)
+    svc.voice_sessions[conv_id] = session
+    runner = asyncio.create_task(session.run())
+    try:
+        async for msg in ws:
+            if msg.type is WSMsgType.BINARY:
+                session.feed_audio(msg.data)
+            elif msg.type is WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                except ValueError:
+                    continue
+                if isinstance(data, dict) and data.get("type") == "text" and data.get("content"):
+                    await session.feed_text(str(data["content"]))
+    except Exception as e:
+        log.info("voice socket ended: %s", e)
+    finally:
+        session.stop()
+        svc.voice_sessions.pop(conv_id, None)
+        try:
+            await asyncio.wait_for(runner, timeout=5)
+        except (asyncio.TimeoutError, Exception):
+            runner.cancel()
+            await asyncio.gather(runner, return_exceptions=True)
+    return ws
+
+
 # ---------------------------------------------------------------- config
 
 async def config_pull(request: web.Request) -> web.Response:
@@ -400,6 +452,7 @@ def add_web_routes(app: web.Application, static_dir: Path | None) -> None:
         web.get("/api/events", events_list),
         web.get("/api/telemetry", telemetry_all),
         web.get("/config", config_pull),
+        web.get("/voice/ws", voice_ws),
         web.get("/", shell),
         web.get("/login", shell),
         web.get("/overview", shell),
@@ -411,3 +464,5 @@ def add_web_routes(app: web.Application, static_dir: Path | None) -> None:
     ])
     if static_dir.is_dir():
         app.router.add_static("/static", static_dir, show_index=False)
+    if WEBASSETS_DIR.is_dir():
+        app.router.add_static("/shared", WEBASSETS_DIR, show_index=False)
