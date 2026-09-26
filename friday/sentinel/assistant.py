@@ -29,6 +29,17 @@ TOOL_OUTPUT_LIMIT = 8_000
 DEFAULT_TITLE = "New conversation"
 TITLE_LIMIT = 60
 
+# What set_controls may write. Everything here is operational and reversible;
+# secrets and LLM routes are deliberately absent — a misheard model name would
+# silently break every agent, and a key can never be read back to verify.
+MONITOR_KEYS = {name: f"controls.monitors.{name}" for name in ("email", "calendar", "jira")}
+TIMING_KEYS = {
+    "telemetry_interval_s": "sentinel.telemetry_interval_s",
+    "heartbeat_interval_s": "sentinel.heartbeat_interval_s",
+    "retention_days": "sentinel.retention_days",
+    "chat_retention_days": "sentinel.chat_retention_days",
+}
+
 SYSTEM_PROMPT = (
     "You are FRIDAY, the assistant running on the sentinel node `{node_id}`. You can inspect "
     "nodes, telemetry, the event queue, recent activity and settings, and change the call mode, "
@@ -84,13 +95,22 @@ class ToolSet:
              "limit": {"type": "integer", "description": "1-50, default 20."}}}},
         {"name": "get_settings", "description": "Current settings with their source; secret values are masked.",
          "parameters": {"type": "object", "properties": {}}},
-        {"name": "set_controls", "description": "Change the call mode, do-not-disturb, or monitor switches.",
+        {"name": "set_controls",
+         "description": "Change the call mode, do-not-disturb, the monitor switches, or the "
+                        "sentinel's timing and retention parameters.",
          "parameters": {"type": "object", "properties": {
              "call_mode": {"type": "string", "description": "always, urgent_only or mute."},
              "dnd": {"type": "boolean", "description": "Do not disturb on/off."},
              "monitors": {"type": "object", "description": "Switches: email, calendar, jira → boolean.",
                           "properties": {"email": {"type": "boolean"}, "calendar": {"type": "boolean"},
-                                         "jira": {"type": "boolean"}}}}}},
+                                         "jira": {"type": "boolean"}}},
+             "timing": {"type": "object",
+                        "description": "Operational parameters, applied live without a restart.",
+                        "properties": {
+                            "telemetry_interval_s": {"type": "number", "description": "1-3600 seconds."},
+                            "heartbeat_interval_s": {"type": "number", "description": "1-3600 seconds."},
+                            "retention_days": {"type": "integer", "description": "1-365 days of events and telemetry."},
+                            "chat_retention_days": {"type": "integer", "description": "1-3650 days of conversations."}}}}}},
     ]
 
     def __init__(self, services, user: User):
@@ -139,16 +159,21 @@ class ToolSet:
 
     async def _tool_set_controls(self, args: dict) -> str:
         updates: dict[str, Any] = {}
+        ignored: list[str] = sorted(set(args) - {"call_mode", "dnd", "monitors", "timing"})
         if args.get("call_mode") is not None:
             updates["controls.call_mode"] = args["call_mode"]
         if args.get("dnd") is not None:
             updates["controls.dnd"] = args["dnd"]
-        monitors = args.get("monitors")
-        if isinstance(monitors, dict):
-            for name in ("email", "calendar", "jira"):
-                if monitors.get(name) is not None:
-                    updates[f"controls.monitors.{name}"] = monitors[name]
-        ignored = sorted(set(args) - {"call_mode", "dnd", "monitors"})
+        for group, mapping in (("monitors", MONITOR_KEYS), ("timing", TIMING_KEYS)):
+            values = args.get(group)
+            if not isinstance(values, dict):
+                continue
+            for name, value in values.items():
+                if name not in mapping:
+                    ignored.append(f"{group}.{name}")
+                elif value is not None:
+                    updates[mapping[name]] = value
+        ignored = sorted(ignored)
         if not updates:
             return _dumps({"error": "nothing to update", "ignored": ignored})
         try:

@@ -430,8 +430,26 @@ async def shell(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(index, headers={"Cache-Control": "no-cache"})
 
 
+@web.middleware
+async def revalidate_static(request: web.Request, handler):
+    """Force the browser to revalidate dashboard assets on every load.
+
+    FileResponse sends ETag and Last-Modified but no Cache-Control. With neither
+    that nor Expires, browsers fall back to *heuristic* freshness — they treat a
+    file that has not changed in a while as fresh for a fraction of its age and
+    serve it without ever asking us, so an edited module keeps running the old
+    code after a deploy. "no-cache" keeps the cache but requires revalidation,
+    so an unchanged file still costs only a 304.
+    """
+    response = await handler(request)
+    if request.path.startswith(("/static/", "/shared/")):
+        response.headers.setdefault("Cache-Control", "no-cache")
+    return response
+
+
 def add_web_routes(app: web.Application, static_dir: Path | None) -> None:
     static_dir = static_dir or DASHBOARD_DIR
+    app.middlewares.append(revalidate_static)
     app[STATIC_DIR] = static_dir
     app.add_routes([
         web.post("/auth/login", login),

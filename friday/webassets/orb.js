@@ -340,6 +340,11 @@ function init() {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.setClearColor(0x000000, 0);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
+  // Self-contained sizing: the desktop HUD styles ".orb-stage canvas" in its own
+  // sheet, but the dashboard has no such rule, and a canvas with only pixel
+  // attributes lays out at its intrinsic size — overflowing the stage and
+  // swallowing clicks meant for the UI beneath it.
+  renderer.domElement.style.display = "block";
   stage.appendChild(renderer.domElement);
 
   scene = new THREE.Scene();
@@ -390,7 +395,7 @@ function resize() {
   const h = stage.clientHeight;
   if (!w || !h) return;
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.setSize(w, h, false);
+  renderer.setSize(w, h);            // updateStyle: the canvas gets a CSS size too
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   if (particles) {

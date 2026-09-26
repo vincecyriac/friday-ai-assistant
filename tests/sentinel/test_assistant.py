@@ -280,3 +280,46 @@ def test_trim_history_drops_whole_groups_from_the_front():
     trimmed = trim_history(msgs, budget=250)
     assert trimmed == msgs[3:]                                           # the assistant+tool group went together
     assert trim_history(msgs, budget=1) == msgs[-1:]                     # never empty
+
+
+async def test_set_controls_writes_timing_parameters(services):
+    provider = ScriptedProvider(
+        [call("set_controls", timing={"telemetry_interval_s": 5, "retention_days": 30}), END],
+        [text("Done."), END])
+    events = await _turn(services, provider)
+    out = json.loads(events[1]["output"])
+    assert out["updated"] == ["sentinel.retention_days", "sentinel.telemetry_interval_s"]
+    assert services.config.get("sentinel.telemetry_interval_s") == 5.0
+    assert services.config.get("sentinel.retention_days") == 30
+    audit = [r for r in await services.store.audit_list() if r.action == "settings.update"]
+    assert {r.target for r in audit} == {"sentinel.telemetry_interval_s", "sentinel.retention_days"}
+    assert all(r.actor == "user:vince via assistant" for r in audit)
+
+
+async def test_set_controls_timing_is_range_validated(services):
+    provider = ScriptedProvider([call("set_controls", timing={"heartbeat_interval_s": 0}), END],
+                                [text("no"), END])
+    events = await _turn(services, provider)
+    out = json.loads(events[1]["output"])
+    assert "invalid" in out and "sentinel.heartbeat_interval_s" in out["invalid"]
+    assert services.config.source("sentinel.heartbeat_interval_s") == "default"
+
+
+async def test_set_controls_mixes_controls_and_timing_and_reports_unknown(services):
+    provider = ScriptedProvider(
+        [call("set_controls", dnd=True, timing={"chat_retention_days": 7, "bogus_interval": 1}), END],
+        [text("ok"), END])
+    events = await _turn(services, provider)
+    out = json.loads(events[1]["output"])
+    assert out["updated"] == ["controls.dnd", "sentinel.chat_retention_days"]
+    assert out["ignored"] == ["timing.bogus_interval"]
+    assert services.config.get("controls.dnd") is True
+    assert services.config.get("sentinel.chat_retention_days") == 7
+
+
+def test_set_controls_declaration_advertises_timing():
+    spec = next(d for d in ToolSet.declarations if d["name"] == "set_controls")
+    props = spec["parameters"]["properties"]
+    assert set(props) == {"call_mode", "dnd", "monitors", "timing"}
+    assert set(props["timing"]["properties"]) == {"telemetry_interval_s", "heartbeat_interval_s",
+                                                  "retention_days", "chat_retention_days"}

@@ -157,3 +157,15 @@ def test_voice_module_uses_relative_urls_and_the_shared_orb():
     assert "getUserMedia" in src and "24000" in src and "16000" in src
     # the AudioContext must be created/resumed inside the click handler's call chain
     assert "resume()" in src
+
+
+async def test_static_assets_must_be_revalidated(aiohttp_client, services):
+    """FileResponse sends ETag/Last-Modified but no Cache-Control, so browsers fall
+    back to heuristic freshness and serve an edited module from cache without ever
+    asking. "no-cache" keeps the cache but forces revalidation (a 304 when unchanged)."""
+    client = await aiohttp_client(create_app(services))
+    for path in ("/static/app.js", "/static/views/assistant.js", "/static/tailwind.css",
+                 "/shared/orb.js"):
+        resp = await client.get(path)
+        assert resp.status == 200, path
+        assert "no-cache" in resp.headers.get("Cache-Control", ""), f"{path} may be served stale"

@@ -37,3 +37,12 @@ def test_import_map_addresses_are_spec_valid():
             for specifier, address in json.loads(block).get("imports", {}).items():
                 assert address.startswith(("/", "./", "../", "http://", "https://")), \
                     f"{html_path}: import map address {address!r} for {specifier!r} is not resolvable"
+
+
+def test_orb_sizes_its_own_canvas():
+    """The orb is shared by two hosts, so it may not depend on either one's CSS.
+    setSize(w, h, false) leaves the canvas with pixel attributes but no CSS size:
+    it then lays out at its intrinsic size, overflows the stage and eats clicks."""
+    src = (WEBASSETS_DIR / "orb.js").read_text()
+    assert "setSize(w, h, false)" not in src
+    assert "renderer.domElement.style.display" in src

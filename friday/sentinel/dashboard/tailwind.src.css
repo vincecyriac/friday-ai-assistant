@@ -52,4 +52,29 @@
   .prose-friday blockquote { @apply border-l-2 border-zinc-700 pl-3 text-zinc-400; }
   .prose-friday a { @apply text-indigo-300 underline; }
   .prose-friday hr { @apply border-zinc-800; }
+
+  /* ---- Assistant HUD: the orb is the interface, nothing persists on it ---- */
+  .hud { @apply relative flex h-[calc(100vh-9rem)] flex-col; }
+  .hud-main { @apply flex min-h-0 flex-1 flex-col items-center justify-center gap-6; }
+  .hud-orb { @apply h-64 w-64 shrink-0 overflow-hidden md:h-80 md:w-80; }
+  .hud-foot { @apply flex shrink-0 flex-col items-center gap-3 pb-2; }
+  .caption { @apply max-w-2xl px-4 text-center text-base leading-relaxed opacity-0 transition-opacity duration-300; }
+  .caption.show { @apply opacity-100; }
+  .caption-friday { @apply text-zinc-100; }
+  .caption-user { @apply text-indigo-300; }
+  .command-pill { @apply flex w-full max-w-xl items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/80 py-1.5 pl-5 pr-1.5 opacity-70 transition-all duration-150 hover:opacity-100 focus-within:border-indigo-500/60 focus-within:opacity-100; }
+  .command-input { @apply min-w-0 flex-1 bg-transparent py-1.5 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none; }
+  .command-send { @apply shrink-0 rounded-full px-3 py-1.5 text-sm text-zinc-400 transition-colors duration-150 hover:bg-zinc-800 hover:text-zinc-100; }
+  .command-mic { @apply shrink-0 rounded-full border border-zinc-700 px-3 py-1 text-xs text-zinc-300 transition-colors duration-150 hover:bg-zinc-800; }
+  .command-mic-on { @apply border-indigo-500 bg-indigo-500 text-white; }
+  .drawer-toggle { @apply rounded-full px-3 py-1 text-xs text-zinc-500 transition-colors duration-150 hover:text-zinc-300; }
+  .drawer { @apply pointer-events-none absolute inset-x-0 bottom-0 max-h-0 overflow-hidden rounded-t-xl border border-zinc-800 bg-zinc-900 opacity-0 transition-all duration-200; }
+  .drawer-open { @apply pointer-events-auto max-h-80 opacity-100; }
+  .drawer-head { @apply flex items-center justify-between border-b border-zinc-800 px-4 py-2; }
+  .drawer-body { @apply max-h-64 space-y-1.5 overflow-y-auto px-4 py-3; }
+  .drawer-line { @apply flex items-baseline gap-2 text-sm; }
+  .drawer-who { @apply w-12 shrink-0 font-mono text-xs; }
+  .drawer-text { @apply min-w-0 flex-1 text-zinc-200; }
+  .drawer-via { @apply shrink-0 text-xs text-zinc-500; }
+  .drawer-time { @apply shrink-0 font-mono text-xs text-zinc-600; }
 }

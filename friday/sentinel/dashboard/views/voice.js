@@ -41,13 +41,15 @@ export function createVoice({ orbStage, onTranscript, onTool, onTurnComplete, co
     && (window.AudioContext || window.webkitAudioContext));
 
   async function ensureOrb() {
-    if (state.orb || !orbStage) return;
+    if (state.orb || !orbStage) return null;
     try {
       const mod = await import("../../shared/orb.js");
       state.orb = mod.mountOrb(orbStage);
+      setOrbState(state.active ? "listening" : "idle");
     } catch (e) {
-      console.warn("orb unavailable", e);
+      console.warn("orb unavailable", e);       // WebGL blocked: the rest still works
     }
+    return state.orb;
   }
 
   function setOrbState(name) {
@@ -221,6 +223,17 @@ export function createVoice({ orbStage, onTranscript, onTool, onTurnComplete, co
   }
 
   return {
+    /** Put the orb on screen. Called when the view mounts — FRIDAY's presence is
+     *  there before you speak to her, and WebGL needs no user gesture. */
+    mountOrb: ensureOrb,
+    /** Type into a live voice turn, so FRIDAY answers aloud in the same session. */
+    sendText(text) {
+      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return false;
+      state.ws.send(JSON.stringify({ type: "text", content: text }));
+      return true;
+    },
+    /** Drive the orb from outside a voice session (the text path uses this). */
+    setState: setOrbState,
     async toggle() { if (state.active) stop(); else await start(); },
     stop,
     get active() { return state.active; },
