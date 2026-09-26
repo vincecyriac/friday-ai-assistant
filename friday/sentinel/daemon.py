@@ -30,6 +30,7 @@ from friday.sentinel.monitors import Housekeeping, SelfHeartbeat, TelemetryMonit
 from friday.sentinel.runtime_config import RuntimeConfig
 from friday.sentinel.sdnotify import sd_notify
 from friday.sentinel.services import HealthState, Services
+from friday.sentinel.watch import WatchRunner
 
 
 class Sentinel:
@@ -43,6 +44,7 @@ class Sentinel:
         self.ready = asyncio.Event()
         self.api_port: int | None = None
         self.services: Services | None = None
+        self.watch: WatchRunner | None = None
         self.state = HealthState(started_at=time.time(), platform=detect())
         self._shutdown = asyncio.Event()
         self._reason = ""
@@ -124,9 +126,13 @@ class Sentinel:
             self.api_port = server.port
             log.info("API listening on http://%s:%s", s.sentinel_bind_host, server.port)
 
+            watch_runner = WatchRunner(services)
+            self.watch = watch_runner
+            services.watch = watch_runner
             for monitor in (TelemetryMonitor(services.config),
                             SelfHeartbeat(services.config),
-                            Housekeeping(services.config)):
+                            Housekeeping(services.config),
+                            watch_runner):
                 monitor_tasks.append(asyncio.create_task(
                     self._supervise(monitor.name, lambda m=monitor: m.run(ctx), log),
                     name=f"monitor:{monitor.name}"))

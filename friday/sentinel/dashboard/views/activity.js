@@ -4,9 +4,11 @@ import { cls, el, fmt } from "../ui.js";
 
 export const title = "Activity";
 const MAX_ROWS = 500;
-const PREFIXES = ["node", "telemetry", "audit", "config", "sentinel", "triage", "escalation", "message"];
+const PREFIXES = ["node", "telemetry", "monitor", "audit", "config", "sentinel", "triage",
+                  "escalation", "message"];
 const BADGE = {
-  node: cls("badge-emerald"), telemetry: cls("badge-zinc"), audit: cls("badge-indigo"), config: cls("badge-amber"),
+  node: cls("badge-emerald"), telemetry: cls("badge-zinc"), monitor: cls("badge-indigo"),
+  audit: cls("badge-indigo"), config: cls("badge-amber"),
   sentinel: cls("badge-zinc"), triage: cls("badge-rose"), escalation: cls("badge-rose"), message: cls("badge-rose"),
 };
 
@@ -20,6 +22,8 @@ export function summary(evt) {
     }
     case "audit.entry": return `${p.actor || ""} ${p.action || ""} ${p.target || ""}`.trim();
     case "config.changed": return `${p.actor || ""}: ${(p.keys || []).join(", ")}`;
+    case "monitor.item": return `${p.source || ""} · ${p.title || ""}`.trim();
+    case "monitor.error": return `${p.source || ""}: ${p.message || ""}`.trim();
     default: return JSON.stringify(p).slice(0, 80);
   }
 }

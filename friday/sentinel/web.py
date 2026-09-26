@@ -261,6 +261,19 @@ async def telemetry_all(request: web.Request) -> web.Response:
     return web.json_response({"nodes": await request.app[SERVICES].store.telemetry_latest_all()})
 
 
+async def watch_status(request: web.Request) -> web.Response:
+    await require_user(request)
+    svc = request.app[SERVICES]
+    runner = getattr(svc, "watch", None)
+    if runner is None:
+        return web.json_response({"sources": {}, "recent": []})
+    rows = await svc.store.watch_items_list(limit=10)
+    # Titles and senders only: the card is glanceable and a body is not.
+    recent = [{"id": r.id, "source": r.source, "title": r.title, "who": r.who,
+               "url": r.url, "ts": r.ts, "first_seen": r.first_seen} for r in rows]
+    return web.json_response({"sources": runner.status(), "recent": recent})
+
+
 # ------------------------------------------------------------------ chat
 
 MAX_CHAT_CONTENT = 8000
@@ -469,6 +482,7 @@ def add_web_routes(app: web.Application, static_dir: Path | None) -> None:
         web.post("/api/chat/{id}/messages", chat_message),
         web.get("/api/events", events_list),
         web.get("/api/telemetry", telemetry_all),
+        web.get("/api/watch", watch_status),
         web.get("/config", config_pull),
         web.get("/voice/ws", voice_ws),
         web.get("/", shell),

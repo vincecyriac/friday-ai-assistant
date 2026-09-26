@@ -40,6 +40,7 @@ class Services:
     limiter: LoginLimiter
     chat_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     voice_sessions: dict[str, Any] = field(default_factory=dict)
+    watch: Any = None                      # the WatchRunner, so the API can read status()
 
     async def audit(self, actor: str, action: str, target: str | None,
                     detail: Mapping[str, Any]) -> int:

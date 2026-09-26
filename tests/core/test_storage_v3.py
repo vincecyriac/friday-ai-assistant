@@ -25,7 +25,7 @@ def test_v2_database_upgrades_to_v3(tmp_path, monkeypatch):
 
     s = Store.open(path)
     try:
-        assert s.schema_version() == 4
+        assert s.schema_version() == 5
         assert s.setting_get("controls.dnd").value == "true"
         assert s.user_get("vince") is not None and s.node_token_by_hash("hash") is not None
         names = {r[0] for r in s.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}

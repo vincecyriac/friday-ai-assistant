@@ -169,3 +169,14 @@ async def test_static_assets_must_be_revalidated(aiohttp_client, services):
         resp = await client.get(path)
         assert resp.status == 200, path
         assert "no-cache" in resp.headers.get("Cache-Control", ""), f"{path} may be served stale"
+
+
+def test_overview_renders_the_watching_card():
+    src = (DASHBOARD_DIR / "views" / "overview.js").read_text()
+    assert "api/watch" in src and "Watching" in src
+    assert not re.search(r'["\']/api/watch', src)          # relative, like every other call
+
+
+def test_activity_badges_monitor_events():
+    src = (DASHBOARD_DIR / "views" / "activity.js").read_text()
+    assert '"monitor"' in src

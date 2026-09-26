@@ -3,7 +3,12 @@ import { socket } from "../socket.js";
 import { LEVEL, cls, debounce, el, fmt, level } from "../ui.js";
 
 export const title = "Overview";
-const REFRESH_TYPES = new Set(["node.heartbeat", "telemetry.sample", "sentinel.started"]);
+const REFRESH_TYPES = new Set(["node.heartbeat", "telemetry.sample", "sentinel.started",
+                               "monitor.item", "monitor.error"]);
+const WATCH_TONE = { watching: "ok", disabled: "none", unconfigured: "none",
+                     degraded: "warn", needs_reauth: "danger" };
+const WATCH_LABEL = { watching: "watching", disabled: "off", unconfigured: "not configured",
+                      degraded: "degraded", needs_reauth: "needs reauth" };
 
 function tile(label, value, pct, lvl, subtitle) {
   return el("div", { class: "rounded-lg border border-zinc-800 bg-zinc-950 p-3" }, [
@@ -65,12 +70,13 @@ function queueTiles(health) {
 export async function mount(root) {
   const grid = el("div", { class: "grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3" });
   root.append(grid);
-  const data = { nodes: [], telemetry: {}, health: null, heartbeat: 30 };
+  const data = { nodes: [], telemetry: {}, health: null, heartbeat: 30, watch: null };
 
   async function load() {
-    const [nodes, telemetry, health, settings] = await Promise.all([
-      api("nodes"), api("api/telemetry"), api("health"), api("api/settings")]);
+    const [nodes, telemetry, health, settings, watch] = await Promise.all([
+      api("nodes"), api("api/telemetry"), api("health"), api("api/settings"), api("api/watch")]);
     data.nodes = nodes;
+    data.watch = watch;
     data.telemetry = telemetry.nodes || {};
     data.health = health;
     const hb = settings.values.find((v) => v.key === "sentinel.heartbeat_interval_s");
@@ -104,9 +110,41 @@ export async function mount(root) {
     return el("section", { class: "card" }, children);
   }
 
+  function watchCard(watch) {
+    const names = Object.keys(watch.sources || {});
+    const rows = names.map((name) => {
+      const info = watch.sources[name];
+      const tone = WATCH_TONE[info.state] || "none";
+      return el("div", { class: "flex items-baseline justify-between gap-3 py-1.5" }, [
+        el("span", { class: "flex items-center gap-2" }, [
+          el("span", { class: cls("dot", LEVEL[tone].dot) }),
+          el("span", { class: "font-mono text-xs", text: name }),
+          el("span", { class: cls("text-xs", LEVEL[tone].text),
+                       text: WATCH_LABEL[info.state] || info.state }),
+        ]),
+        el("span", { class: "min-w-0 truncate text-right text-xs text-zinc-500",
+                     title: info.last_error || "",
+                     text: info.last_error
+                       ? info.last_error
+                       : `${info.items_today} today · ${fmt.ago(info.last_poll)}` }),
+      ]);
+    });
+    const recent = (watch.recent || []).slice(0, 5).map((r) => el("div", {
+      class: "truncate py-0.5 text-xs text-zinc-400",
+      text: `${r.source} · ${r.title}`, title: `${r.who} — ${fmt.when(r.first_seen)}` }));
+    return el("section", { class: "card" }, [
+      el("h2", { class: "card-title", text: "Watching" }),
+      names.length ? el("div", { class: "divide-y divide-zinc-800/60" }, rows)
+                   : el("p", { class: "text-zinc-400", text: "No sources configured yet." }),
+      recent.length ? el("div", { class: "mt-3 border-t border-zinc-800 pt-2" }, recent) : null,
+    ]);
+  }
+
   function draw() {
-    grid.replaceChildren(...(data.nodes.length ? data.nodes.map(nodeCard)
-      : [el("div", { class: "card text-zinc-400", text: "No nodes have reported yet." })]));
+    const cards = data.nodes.length ? data.nodes.map(nodeCard)
+      : [el("div", { class: "card text-zinc-400", text: "No nodes have reported yet." })];
+    if (data.watch && Object.keys(data.watch.sources || {}).length) cards.unshift(watchCard(data.watch));
+    grid.replaceChildren(...cards);
   }
 
   const reload = debounce(() => load().catch(() => {}), 500);

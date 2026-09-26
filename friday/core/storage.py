@@ -89,6 +89,14 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
     4: (
         "ALTER TABLE messages ADD COLUMN via TEXT NOT NULL DEFAULT 'text'",
     ),
+    5: (
+        "CREATE TABLE watch_items ("
+        "  id TEXT PRIMARY KEY, source TEXT NOT NULL, external_id TEXT NOT NULL,"
+        "  title TEXT NOT NULL, snippet TEXT NOT NULL, who TEXT NOT NULL, url TEXT NOT NULL,"
+        "  ts REAL NOT NULL, first_seen REAL NOT NULL, meta TEXT NOT NULL)",
+        "CREATE INDEX watch_items_seen ON watch_items(first_seen DESC)",
+        "CREATE INDEX watch_items_source_ts ON watch_items(source, ts DESC)",
+    ),
 }
 
 _EVENT_COLUMNS = "id, ts, source, type, payload, priority, status, attempts, error, claimed_at, processed_at"
@@ -208,6 +216,28 @@ _MESSAGE_COLUMNS = ("id, conversation_id, seq, role, content, tool_name, tool_ar
 def _row_to_conversation(row: sqlite3.Row) -> ConversationRow:
     return ConversationRow(row["id"], row["title"], row["created_at"], row["updated_at"],
                            int(row["message_count"]))
+
+
+@dataclass(frozen=True)
+class WatchRow:
+    id: str
+    source: str
+    external_id: str
+    title: str
+    snippet: str
+    who: str
+    url: str
+    ts: float
+    first_seen: float
+    meta: dict
+
+
+_WATCH_COLUMNS = "id, source, external_id, title, snippet, who, url, ts, first_seen, meta"
+
+
+def _row_to_watch(row: sqlite3.Row) -> WatchRow:
+    return WatchRow(row["id"], row["source"], row["external_id"], row["title"], row["snippet"],
+                    row["who"], row["url"], row["ts"], row["first_seen"], json.loads(row["meta"]))
 
 
 def _row_to_message(row: sqlite3.Row) -> MessageRow:
@@ -685,6 +715,41 @@ class Store:
     def message_set_status(self, id: int, status: str) -> None:
         self._conn.execute("UPDATE messages SET status = ? WHERE id = ?", (status, id))
 
+    # ----------------------------------------------------------- watch items
+
+    def watch_item_add(self, item: Any, first_seen: float) -> bool:
+        """True when the item is new. The INSERT is the dedupe: a source polled
+        every two minutes re-offers the same message, and only the first lands."""
+        cursor = self._conn.execute(
+            f"INSERT OR IGNORE INTO watch_items ({_WATCH_COLUMNS}) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (item.id, item.source, item.external_id, item.title, item.snippet, item.who,
+             item.url, item.ts, first_seen, json.dumps(dict(item.meta))))
+        return cursor.rowcount > 0
+
+    def watch_item_get(self, id: str) -> WatchRow | None:
+        row = self._conn.execute(
+            f"SELECT {_WATCH_COLUMNS} FROM watch_items WHERE id = ?", (id,)).fetchone()
+        return None if row is None else _row_to_watch(row)
+
+    def watch_items_list(self, source: str | None = None, limit: int = 100) -> list[WatchRow]:
+        where = "WHERE source = ?" if source else ""
+        params: tuple = (source, limit) if source else (limit,)
+        rows = self._conn.execute(
+            f"SELECT {_WATCH_COLUMNS} FROM watch_items {where} "
+            "ORDER BY first_seen DESC, id LIMIT ?", params).fetchall()
+        return [_row_to_watch(r) for r in rows]
+
+    def watch_counts(self, since_ts: float) -> dict[str, int]:
+        rows = self._conn.execute(
+            "SELECT source, COUNT(*) FROM watch_items WHERE first_seen >= ? GROUP BY source",
+            (since_ts,)).fetchall()
+        return {r[0]: int(r[1]) for r in rows}
+
+    def watch_items_prune(self, before_ts: float) -> int:
+        return self._conn.execute(
+            "DELETE FROM watch_items WHERE first_seen < ?", (before_ts,)).rowcount
+
 
 class AsyncStore:
     """A ``Store`` driven from asyncio.
@@ -877,3 +942,18 @@ class AsyncStore:
 
     async def message_set_status(self, id: int, status: str) -> None:
         await self.run(self._store.message_set_status, id, status)
+
+    async def watch_item_add(self, item: Any, first_seen: float) -> bool:
+        return await self.run(self._store.watch_item_add, item, first_seen)
+
+    async def watch_item_get(self, id: str) -> WatchRow | None:
+        return await self.run(self._store.watch_item_get, id)
+
+    async def watch_items_list(self, source: str | None = None, limit: int = 100) -> list[WatchRow]:
+        return await self.run(self._store.watch_items_list, source, limit)
+
+    async def watch_counts(self, since_ts: float) -> dict[str, int]:
+        return await self.run(self._store.watch_counts, since_ts)
+
+    async def watch_items_prune(self, before_ts: float) -> int:
+        return await self.run(self._store.watch_items_prune, before_ts)

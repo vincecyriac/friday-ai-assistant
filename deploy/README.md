@@ -47,6 +47,29 @@ is committed. After editing any class in the HTML/JS run `deploy/build_css.sh`
 (downloads the Tailwind 3.4.17 standalone binary into `.cache/` once; no Node
 needed) — `tests/sentinel/test_dashboard_files.py` fails on a stale build.
 
+## Watching mail, calendar and Jira
+
+FRIDAY can watch three surfaces. Everything is off until you configure it and flip the
+switch on **Controls**.
+
+```bash
+# 1. Jira and personal mail: paste the credentials into Settings → sources in the dashboard.
+#    sources.jira.base_url / .email / .api_token      (an Atlassian API token)
+#    sources.imap.host / .user / .password            (an app password; there is no SMTP setting)
+# 2. Work mail and calendar: create a Google Cloud OAuth client (Desktop app), put the id and
+#    secret in Settings → sources, then grant access once from a machine with a browser:
+.venv/bin/python -m friday.sentinel google-auth
+#    On a headless Pi, run it on your laptop with --print-only and paste the token into Settings.
+```
+
+What each capability may do is fixed in code, not configuration: mail is read-and-draft
+(IMAP drafts are written with `APPEND`, and **no SMTP credential exists anywhere**, so sending
+is impossible), the calendar may only modify events FRIDAY itself created, and Jira is GET-only.
+Nothing is scored or escalated yet — that is the next sub-project. The **Watching** card on
+Overview shows each source's state, and every item appears in Activity as `monitor.item`.
+
+`friday-sentinel google-auth --revoke` forgets the token; the sources then report `needs reauth`.
+
 ## Linux (Fedora, Raspberry Pi OS): systemd
 
 ```bash
@@ -107,6 +130,7 @@ Tailscale Serve passes them as-is.
 | `GET /config?scope=desktop` | node token or session | decrypted config for a node scope; audited |
 | `GET /api/events?type=&source=&since=&before=&limit=` | session | events, newest first (type is a glob) |
 | `GET /api/telemetry` | node token or session | latest snapshot per node |
+| `GET /api/watch` | session | per-source state and the last ten items seen |
 | `GET/POST /api/chat`, `GET/DELETE /api/chat/{id}` | session | assistant conversations |
 | `POST /api/chat/{id}/messages` | session | one turn; `application/x-ndjson` stream of `delta` / `tool` / `result` / `error` / `done` |
 | `GET /voice/ws?conversation=<id>` | node token or session | Live voice: binary PCM both ways, JSON control frames |

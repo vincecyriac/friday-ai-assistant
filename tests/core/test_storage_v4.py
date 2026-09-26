@@ -25,7 +25,7 @@ def test_v3_database_upgrades_to_v4_and_defaults_via(tmp_path, monkeypatch):
 
     s = Store.open(path)
     try:
-        assert s.schema_version() == 4
+        assert s.schema_version() == 5
         rows = s.messages_list("c1")
         assert len(rows) == 1 and rows[0].content == "hello" and rows[0].via == "text"
     finally:

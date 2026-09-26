@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 from types import SimpleNamespace
 
 import psutil
@@ -71,6 +72,16 @@ def test_vcgencmd_is_parsed_when_present(monkeypatch, tmp_path):
     exe.write_text("#!/bin/sh\necho 'throttled=0x50005'\n")
     exe.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path))
+
+    # The behaviour under test is "find vcgencmd and parse what it prints", not
+    # "a process can be spawned in under two seconds". Spawning a real one made
+    # this test fail about one run in six on a loaded machine: the production
+    # 2 s timeout expired and _vcgencmd_throttled correctly returned None.
+    def fake_run(argv, **kwargs):
+        assert argv == [str(exe), "get_throttled"]
+        return subprocess.CompletedProcess(argv, 0, stdout="throttled=0x50005\n", stderr="")
+
+    monkeypatch.setattr(telemetry.subprocess, "run", fake_run)
     assert telemetry._vcgencmd_throttled() == 0x50005
     power = telemetry._power()
     assert power is not None

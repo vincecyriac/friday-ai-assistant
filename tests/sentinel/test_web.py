@@ -130,7 +130,7 @@ async def test_origin_must_match_host(client):
 async def test_settings_schema_get_put(client, services):
     await login(client)
     schema = await (await client.get("/api/settings/schema")).json()
-    assert [g["name"] for g in schema["groups"]] == ["llm", "desktop", "sentinel", "voice", "controls"]
+    assert [g["name"] for g in schema["groups"]] == ["llm", "desktop", "sentinel", "sources", "voice", "controls"]
 
     values = {v["key"]: v for v in (await (await client.get("/api/settings")).json())["values"]}
     assert values["llm.gemini_api_key"] == {"key": "llm.gemini_api_key", "secret": True, "set": False,

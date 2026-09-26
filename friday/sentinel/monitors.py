@@ -67,6 +67,8 @@ class Housekeeping:
             counts = await ctx.store.prune(now - retention_days * 86400)
             sessions = await ctx.store.sessions_prune(now)
             chats = await ctx.store.conversations_prune(now - chat_days * 86400)
+            watched = await ctx.store.watch_items_prune(now - retention_days * 86400)
             await ctx.store.checkpoint("PASSIVE")
-            ctx.logger.info("housekeeping: pruned %d telemetry rows, %d events, %d sessions, %d chats",
-                            counts["telemetry"], counts["events"], sessions, chats)
+            ctx.logger.info("housekeeping: pruned %d telemetry rows, %d events, %d sessions, "
+                            "%d chats, %d watch items",
+                            counts["telemetry"], counts["events"], sessions, chats, watched)

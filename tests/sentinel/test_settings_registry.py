@@ -66,7 +66,7 @@ def test_generic_types():
 
 def test_schema_has_groups_and_no_values():
     groups = schema()
-    assert [g["name"] for g in groups] == ["llm", "desktop", "sentinel", "voice", "controls"]
+    assert [g["name"] for g in groups] == ["llm", "desktop", "sentinel", "sources", "voice", "controls"]
     flat = json.dumps(groups)
     assert "value" not in flat
     key = next(k for g in groups for k in g["keys"] if k["key"] == "controls.call_mode")
@@ -76,7 +76,7 @@ def test_schema_has_groups_and_no_values():
 
 def test_sentinel_and_monitor_keys():
     from friday.sentinel.settings_registry import GROUP_ORDER
-    assert GROUP_ORDER == ("llm", "desktop", "sentinel", "voice", "controls")
+    assert GROUP_ORDER == ("llm", "desktop", "sentinel", "sources", "voice", "controls")
     assert spec_for("sentinel.telemetry_interval_s").env == "FRIDAY_TELEMETRY_INTERVAL"
     assert spec_for("sentinel.telemetry_interval_s").default == 15.0
     assert spec_for("sentinel.heartbeat_interval_s").default == 30.0
@@ -86,7 +86,7 @@ def test_sentinel_and_monitor_keys():
         assert spec_for(f"controls.monitors.{name}").type == "bool" and spec_for(f"controls.monitors.{name}").default is False
     assert spec_for("llm.routes.assistant").default == "gemini:gemini-3.7-flash"
     assert spec_for("llm.routes.assistant").scopes == () and spec_for("llm.routes.assistant").env == "FRIDAY_LLM_ASSISTANT"
-    assert [g["name"] for g in schema()] == ["llm", "desktop", "sentinel", "voice", "controls"]
+    assert [g["name"] for g in schema()] == ["llm", "desktop", "sentinel", "sources", "voice", "controls"]
 
 
 @pytest.mark.parametrize("key,raw,expected", [
@@ -112,11 +112,50 @@ def test_new_keys_reject_out_of_range(key, raw):
 
 def test_voice_keys():
     from friday.sentinel.settings_registry import GROUP_ORDER
-    assert GROUP_ORDER == ("llm", "desktop", "sentinel", "voice", "controls")
+    assert GROUP_ORDER == ("llm", "desktop", "sentinel", "sources", "voice", "controls")
     assert spec_for("voice.enabled").type == "bool" and spec_for("voice.enabled").default is True
     assert spec_for("voice.name").default == "Aoede"
     assert spec_for("voice.name").choices == ("Aoede", "Kore", "Charon", "Fenrir", "Puck")
     assert validate(spec_for("voice.name"), "Kore") == "Kore"
     with pytest.raises(SettingValidationError):
         validate(spec_for("voice.name"), "Siri")
-    assert [g["name"] for g in schema()] == ["llm", "desktop", "sentinel", "voice", "controls"]
+    assert [g["name"] for g in schema()] == ["llm", "desktop", "sentinel", "sources", "voice", "controls"]
+
+
+def test_sources_keys():
+    from friday.sentinel.settings_registry import GROUP_ORDER
+    assert GROUP_ORDER == ("llm", "desktop", "sentinel", "sources", "voice", "controls")
+    for key in ("sources.google.client_secret", "sources.google.refresh_token",
+                "sources.imap.password", "sources.jira.api_token"):
+        assert spec_for(key).secret is True, key
+    for key in ("sources.google.client_id", "sources.imap.host", "sources.imap.user",
+                "sources.jira.base_url", "sources.jira.email", "sources.jira.jql"):
+        assert spec_for(key).secret is False, key
+    assert spec_for("sources.imap.port").default == 993
+    assert spec_for("sources.imap.drafts_folder").default == "Drafts"
+    assert spec_for("sources.email_interval_s").default == 120.0
+    assert spec_for("sources.calendar_interval_s").default == 300.0
+    assert spec_for("sources.jira_interval_s").default == 300.0
+    assert spec_for("sources.calendar_horizon_min").default == 120
+    assert spec_for("sources.max_backoff_s").default == 900.0
+    from friday.sentinel.sources.jira import DEFAULT_JQL
+    assert spec_for("sources.jira.jql").default == DEFAULT_JQL
+    assert [g["name"] for g in schema()] == ["llm", "desktop", "sentinel", "sources", "voice", "controls"]
+
+
+@pytest.mark.parametrize("key,raw", [
+    ("sources.email_interval_s", "10"),          # below the 30 s floor
+    ("sources.email_interval_s", "99999"),
+    ("sources.calendar_horizon_min", "1"),
+    ("sources.max_backoff_s", "5"),
+    ("sources.imap.port", "70000"),
+])
+def test_sources_ranges_are_enforced(key, raw):
+    with pytest.raises(SettingValidationError):
+        validate(spec_for(key), raw)
+
+
+def test_there_is_no_smtp_setting_anywhere():
+    """Structural guarantee: nothing can be configured to send mail."""
+    from friday.sentinel.settings_registry import REGISTRY
+    assert not [s.key for s in REGISTRY if "smtp" in s.key.lower()]

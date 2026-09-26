@@ -13,8 +13,9 @@ from typing import Any, Callable
 
 from friday.core.config import ConfigError
 from friday.core.llm.routing import parse_route
+from friday.sentinel.sources.jira import DEFAULT_JQL
 
-GROUP_ORDER = ("llm", "desktop", "sentinel", "voice", "controls")
+GROUP_ORDER = ("llm", "desktop", "sentinel", "sources", "voice", "controls")
 
 
 class SettingValidationError(ValueError):
@@ -73,6 +74,43 @@ REGISTRY: tuple[SettingSpec, ...] = (
                 secret=True, scopes=("desktop",), env="TRIPO_API_KEY"),
     SettingSpec("desktop.voice", "str", "desktop", "Gemini Live voice for the desktop (Aoede or Kore)",
                 default="Aoede", scopes=("desktop",), env="FRIDAY_VOICE"),
+    SettingSpec("sources.google.client_id", "str", "sources",
+                "OAuth client id from your Google Cloud project"),
+    SettingSpec("sources.google.client_secret", "str", "sources",
+                "OAuth client secret", secret=True),
+    SettingSpec("sources.google.refresh_token", "str", "sources",
+                "Written by 'friday-sentinel google-auth'; grants Gmail read+compose and Calendar events",
+                secret=True),
+    SettingSpec("sources.imap.host", "str", "sources", "IMAP server for the personal mailbox"),
+    SettingSpec("sources.imap.port", "int", "sources", "IMAP port", default=993,
+                validator=_range(1, 65535)),
+    SettingSpec("sources.imap.user", "str", "sources", "IMAP username"),
+    SettingSpec("sources.imap.password", "str", "sources",
+                "IMAP app password. There is deliberately no SMTP setting: FRIDAY cannot send.",
+                secret=True),
+    SettingSpec("sources.imap.drafts_folder", "str", "sources",
+                "Where drafts are appended (Gmail over IMAP uses '[Gmail]/Drafts')",
+                default="Drafts"),
+    SettingSpec("sources.jira.base_url", "url", "sources",
+                "Jira Cloud base URL, e.g. https://yourteam.atlassian.net"),
+    SettingSpec("sources.jira.email", "str", "sources", "Atlassian account email"),
+    SettingSpec("sources.jira.api_token", "str", "sources", "Atlassian API token", secret=True),
+    SettingSpec("sources.jira.jql", "str", "sources",
+                "What counts as worth watching. Edit freely; an invalid query shows on the "
+                "Watching card rather than retrying.",
+                default=DEFAULT_JQL),
+    SettingSpec("sources.email_interval_s", "float", "sources",
+                "Seconds between mailbox polls", default=120.0, validator=_range(30, 3600)),
+    SettingSpec("sources.calendar_interval_s", "float", "sources",
+                "Seconds between calendar polls", default=300.0, validator=_range(30, 3600)),
+    SettingSpec("sources.jira_interval_s", "float", "sources",
+                "Seconds between Jira polls", default=300.0, validator=_range(30, 3600)),
+    SettingSpec("sources.calendar_horizon_min", "int", "sources",
+                "How far ahead calendar events are surfaced, in minutes",
+                default=120, validator=_range(5, 1440)),
+    SettingSpec("sources.max_backoff_s", "float", "sources",
+                "Longest gap between retries for a degraded source",
+                default=900.0, validator=_range(60, 7200)),
     SettingSpec("voice.enabled", "bool", "voice",
                 "Allow the dashboard to open a voice session with FRIDAY", default=True),
     SettingSpec("voice.name", "enum", "voice",
